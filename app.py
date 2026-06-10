@@ -228,6 +228,35 @@ def login_ui() -> None:
 # PDF / IMAGEN / TEXTO
 # ============================================================
 
+def spatial_text_from_page(page) -> str:
+    """Reconstruye líneas por coordenadas del PDF.
+    Esto es clave para informes Exxer/Z-Logic, porque p.get_text('text') suele mezclar
+    encabezados, barras de referencia y nombres de variables en una sola línea.
+    """
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        return ""
+    if not words:
+        return ""
+    # word tuple: x0,y0,x1,y1,text,block,line,word
+    groups = {}
+    for w in words:
+        x0, y0, x1, y1, txt, block, line, word = w[:8]
+        key = (int(block), int(line))
+        groups.setdefault(key, []).append((float(x0), float(y0), str(txt)))
+    line_items = []
+    for key, vals in groups.items():
+        vals = sorted(vals, key=lambda t: t[0])
+        y = sum(v[1] for v in vals) / max(1, len(vals))
+        text = " ".join(v[2] for v in vals)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            line_items.append((y, min(v[0] for v in vals), text))
+    line_items.sort(key=lambda t: (t[0], t[1]))
+    return "\n".join(t[2] for t in line_items)
+
+
 def render_pdf_page(pdf_bytes: bytes, page: int, zoom: float) -> Tuple[Image.Image, int, str]:
     if fitz is None:
         raise RuntimeError("Falta PyMuPDF. Agregue PyMuPDF al requirements.txt.")
@@ -237,7 +266,10 @@ def render_pdf_page(pdf_bytes: bytes, page: int, zoom: float) -> Tuple[Image.Ima
         page = int(max(0, min(page, total - 1)))
         p = doc.load_page(page)
         pix = p.get_pixmap(matrix=fitz.Matrix(float(zoom), float(zoom)), alpha=False)
-        text = p.get_text("text") or ""
+        plain_text = p.get_text("text") or ""
+        spatial_text = spatial_text_from_page(p)
+        # Primero líneas espaciales; después texto plano como respaldo.
+        text = ("=== LINEAS_ESPACIALES_PDF ===\n" + spatial_text + "\n=== TEXTO_PLANO_PDF ===\n" + plain_text).strip()
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), total, text
     finally:
         doc.close()
@@ -325,68 +357,151 @@ def to_float(x: str):
         return np.nan
 
 
+def first_number_in(s: str):
+    m = re.search(r"-?\d+(?:[\.,]\d+)?", s or "")
+    return to_float(m.group(0)) if m else np.nan
+
+
+def set_df_value(df: pd.DataFrame, code: str, val, state: str = "extraído/revisar") -> None:
+    if pd.isna(val):
+        return
+    idx = df.index[df["codigo"] == code]
+    if len(idx):
+        df.loc[idx[0], "valor"] = float(val)
+        df.loc[idx[0], "estado"] = state
+
+
+def parse_variable_lines(lines: List[str], df: pd.DataFrame) -> None:
+    """Extrae valores cuando el PDF conserva una línea por variable.
+    Ejemplos esperados:
+    FC Frecuencia Cardíaca 57 pulsos/min
+    PA Sistólica/Diastólica (Media) 125/76 (92) mmHg
+    CTS Cociente de Tiempo Sistólico 39% (120/305)
+    """
+    aliases = {
+        "FC": ["FC", "Frecuencia Card"],
+        "DS": ["DS", "Descarga Sist"],
+        "IDS": ["IDS", "Indice de Descarga", "Índice de Descarga"],
+        "VM": ["VM", "Volumen Minuto"],
+        "IC": ["IC", "Indice Card", "Índice Card"],
+        "RVS": ["RVS", "Resistencia Vascular Sist"],
+        "IRV": ["IRV", "Indice de Resistencia", "Índice de Resistencia"],
+        "CA": ["CA", "Complacencia Arterial"],
+        "IV": ["IV", "Indice de Velocidad", "Índice de Velocidad"],
+        "IAC": ["IAC", "Indice de Aceler", "Índice de Aceler"],
+        "ITC": ["ITC", "Indice de Trabajo", "Índice de Trabajo"],
+        "CFT": ["CFT", "Contenido de Fluidos"],
+    }
+    used_line_idx = set()
+    for i, raw in enumerate(lines):
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line:
+            continue
+        # Presión arterial compuesta
+        if re.search(r"^(PA\b|.*Sist[óo]lica/Diast[óo]lica)", line, re.I):
+            m = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})(?:\s*\(?\s*(\d{2,3})\s*\)?)?", line)
+            if m:
+                set_df_value(df, "PAS", to_float(m.group(1)))
+                set_df_value(df, "PAD", to_float(m.group(2)))
+                if m.group(3):
+                    set_df_value(df, "PAM", to_float(m.group(3)))
+                used_line_idx.add(i)
+                continue
+        # CTS compuesto
+        if re.search(r"^(CTS\b|.*Cociente de Tiempo Sist)", line, re.I):
+            m = re.search(r"(\d+(?:[\.,]\d+)?)\s*%?\s*(?:\(?\s*(\d+(?:[\.,]\d+)?)\s*/\s*(\d+(?:[\.,]\d+)?)\s*\)?)?", line)
+            if m:
+                set_df_value(df, "CTS", to_float(m.group(1)))
+                if m.group(2): set_df_value(df, "PPE", to_float(m.group(2)))
+                if m.group(3): set_df_value(df, "PE", to_float(m.group(3)))
+                used_line_idx.add(i)
+                continue
+        for code, keys in aliases.items():
+            if any(re.search(r"(^|\s)" + re.escape(k) + r"(\b|\s)", line, re.I) for k in keys):
+                # tomar números de la línea; el primero suele ser el VALOR del estudio.
+                nums = re.findall(r"-?\d+(?:[\.,]\d+)?", line)
+                if nums:
+                    set_df_value(df, code, to_float(nums[0]))
+                    used_line_idx.add(i)
+                    break
+
+
+def parse_right_panel_text(text: str, df: pd.DataFrame) -> None:
+    """Extrae variables del panel derecho: RR, PE, PPE, dZ/dt Imax, Z0, D/T."""
+    clean = re.sub(r"[\t\r]+", " ", text or " ")
+    clean = re.sub(r" +", " ", clean)
+    patterns = {
+        "RR": r"\bRR\s*(\d+(?:[\.,]\d+)?)",
+        "PE": r"\bPE\s*(\d+(?:[\.,]\d+)?)",
+        "PPE": r"\bPPE\s*(\d+(?:[\.,]\d+)?)",
+        "DZDT_MAX": r"(?:dZ/dt|dz/dt|dZdt|dzdt)\s*(?:Imax|lmax|max)?\s*(\d+(?:[\.,]\d+)?)",
+        "Z0": r"\bZ0\s*(\d+(?:[\.,]\d+)?)",
+        "DIST_D": r"\bD\s*:\s*(\d+(?:[\.,]\d+)?)\s*cm",
+        "DIST_T": r"\bT\s*:\s*(\d+(?:[\.,]\d+)?)\s*cm",
+    }
+    for code, pat in patterns.items():
+        m = re.search(pat, clean, re.I)
+        if m:
+            set_df_value(df, code, to_float(m.group(1)))
+
+
+def fallback_sequence_parse(text: str, df: pd.DataFrame) -> None:
+    """Respaldo para PDFs que exportan los códigos juntos y los valores juntos.
+    Busca una secuencia numérica compatible con la tabla principal del CGI.
+    """
+    # Evita texto del panel derecho para no mezclar RR/PE con tabla izquierda.
+    clean = re.sub(r"[\t\r\n]+", " ", text or " ")
+    clean = re.sub(r" +", " ", clean)
+    # Ventana después de encabezados típicos y antes del panel/observaciones.
+    m = re.search(r"(?:FC\s+PA\s+DS\s+IDS\s+VM\s+IC|PAR[ÁA]METRO\s+VALOR).*?(?:Observaciones|Sistema no invasivo|$)", clean, re.I)
+    segment = m.group(0) if m else clean
+    nums = [to_float(x) for x in re.findall(r"-?\d+(?:[\.,]\d+)?", segment)]
+    nums = [x for x in nums if not pd.isna(x)]
+    # En informes Exxer, los primeros valores clínicos suelen seguir este orden.
+    # Se aplican filtros de plausibilidad para no cargar referencias de barras.
+    candidates = {}
+    for i in range(0, max(0, len(nums) - 12)):
+        a = nums[i:i+14]
+        # FC, PAS, PAD, PAM, DS, IDS, VM, IC, RVS, IRV, CA, IV, IAC, CTS
+        if (35 <= a[0] <= 140 and 60 <= a[1] <= 240 and 30 <= a[2] <= 140 and
+            40 <= a[3] <= 160 and 5 <= a[4] <= 200 and 2 <= a[5] <= 120 and
+            0.5 <= a[6] <= 20 and 0.5 <= a[7] <= 10 and 200 <= a[8] <= 6000 and
+            300 <= a[9] <= 9000):
+            candidates = dict(zip(["FC","PAS","PAD","PAM","DS","IDS","VM","IC","RVS","IRV","CA","IV","IAC","CTS"], a[:14]))
+            break
+    for code, val in candidates.items():
+        set_df_value(df, code, val, "extraído/secuencia/revisar")
+
+
 def parse_report_text(text: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     df = empty_variables_df()
     meta = {"medication": "", "observations": ""}
     if not text or not text.strip():
         return df, meta
-    clean = re.sub(r"[\t\r]+", " ", text)
-    clean = re.sub(r" +", " ", clean)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    joined = "\n".join(lines)
 
-    def setval(code: str, val, state="extraído/revisar"):
-        idx = df.index[df["codigo"] == code]
-        if len(idx):
-            df.loc[idx[0], "valor"] = val
-            df.loc[idx[0], "estado"] = state
+    raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # Prioriza líneas espaciales reconstruidas; son más confiables para la tabla.
+    if "=== LINEAS_ESPACIALES_PDF ===" in text:
+        spatial = text.split("=== LINEAS_ESPACIALES_PDF ===", 1)[1].split("=== TEXTO_PLANO_PDF ===", 1)[0]
+        spatial_lines = [l.strip() for l in spatial.splitlines() if l.strip()]
+    else:
+        spatial_lines = raw_lines
 
-    # Presión 125/76 (92)
-    m = re.search(r"(?:PA|Sist[óo]lica/Diast[óo]lica).*?(\d{2,3})\s*/\s*(\d{2,3})\s*\(?\s*(\d{2,3})?\s*\)?", clean, re.I)
+    parse_variable_lines(spatial_lines, df)
+    parse_right_panel_text(text, df)
+    fallback_sequence_parse(text, df)
+
+    joined = "\n".join(raw_lines)
+    flat = re.sub(r"\s+", " ", joined)
+    m = re.search(r"Medicaci[oó]n\s+(.+?)(?:Observaciones|Dist\.|D:\s*\d|$)", flat, re.I)
     if m:
-        setval("PAS", to_float(m.group(1)))
-        setval("PAD", to_float(m.group(2)))
-        if m.group(3):
-            setval("PAM", to_float(m.group(3)))
-
-    patterns = {
-        "FC": r"(?:FC|Frecuencia Card[ií]aca)\s+.*?(\d{2,3})\s+(?:pulsos|min)",
-        "DS": r"(?:DS|Descarga Sist[óo]lica)\s+.*?(\d+(?:[\.,]\d+)?)\s+(?:ml|mI)",
-        "IDS": r"(?:IDS|[ÍI]ndice de Descarga Sist[óo]lica)\s+.*?(\d+(?:[\.,]\d+)?)\s+(?:ml|mI)",
-        "VM": r"(?:VM|Volumen Minuto)\s+.*?(\d+(?:[\.,]\d+)?)\s+L/min",
-        "IC": r"(?:IC|[ÍI]ndice Card[ií]aco)\s+.*?(\d+(?:[\.,]\d+)?)\s+L/min/m",
-        "RVS": r"(?:RVS|Resistencia Vascular Sist[ée]mica)\s+.*?(\d+(?:[\.,]\d+)?)\s+dyn",
-        "IRV": r"(?:IRV|[ÍI]ndice de Resistencia Vascular)\s+.*?(\d+(?:[\.,]\d+)?)\s+dyn",
-        "CA": r"(?:CA|Complacencia Arterial)\s+.*?(\d+(?:[\.,]\d+)?)\s+(?:ml/mmHg|mI/mmHg)",
-        "IV": r"(?:IV|[ÍI]ndice de Velocidad)\s+.*?(\d+(?:[\.,]\d+)?)\s*/1000",
-        "IAC": r"(?:IAC|[ÍI]ndice de Aceleraci[óo]n Card[ií]aca)\s+.*?(\d+(?:[\.,]\d+)?)\s*/100",
-        "ITC": r"(?:ITC|[ÍI]ndice de Trabajo Card[ií]aco)\s+.*?(\d+(?:[\.,]\d+)?)\s+Kg",
-        "CFT": r"(?:CFT|Contenido de Fluidos Tor[áa]cicos)\s+.*?(\d+(?:[\.,]\d+)?)\s+kohms",
-        "RR": r"RR\s+(\d+(?:[\.,]\d+)?)",
-        "PE": r"\bPE\s+(\d+(?:[\.,]\d+)?)",
-        "PPE": r"\bPPE\s+(\d+(?:[\.,]\d+)?)",
-        "DZDT_MAX": r"(?:dz/dt|dZ/dt)\s*(?:lmax|Imax|max)?\s*(\d+(?:[\.,]\d+)?)",
-        "Z0": r"\bZ0\s+(\d+(?:[\.,]\d+)?)",
-        "DIST_D": r"D:\s*(\d+(?:[\.,]\d+)?)\s*cm",
-        "DIST_T": r"T:\s*(\d+(?:[\.,]\d+)?)\s*cm",
-    }
-    for code, pat in patterns.items():
-        m = re.search(pat, clean, re.I)
-        if m:
-            setval(code, to_float(m.group(1)))
-
-    m = re.search(r"CTS.*?(\d+(?:[\.,]\d+)?)\s*%\s*\(?\s*(\d+(?:[\.,]\d+)?)\s*/\s*(\d+(?:[\.,]\d+)?)\s*\)?", clean, re.I)
-    if m:
-        setval("CTS", to_float(m.group(1)))
-        setval("PPE", to_float(m.group(2)))
-        setval("PE", to_float(m.group(3)))
-
-    m = re.search(r"Medicaci[oó]n\s+(.+?)(?:Observaciones|$)", joined, re.I | re.S)
-    if m:
-        meta["medication"] = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
-    m = re.search(r"Observaciones\s+(.+)$", joined, re.I | re.S)
+        meta["medication"] = re.sub(r"\s+", " ", m.group(1)).strip()[:180]
+    m = re.search(r"Observaciones\s+(.+?)(?:www\.|$)", flat, re.I)
     if m:
         meta["observations"] = re.sub(r"\s+", " ", m.group(1)).strip()[:500]
+
+    # Si se cargaron valores, marcar como validado visualmente pendiente de revisión.
+    # El operador puede editar antes de guardar.
     return df, meta
 
 # ============================================================
