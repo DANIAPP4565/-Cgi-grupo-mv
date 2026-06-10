@@ -1059,6 +1059,38 @@ def studies_df(scope_user: dict | None = None) -> pd.DataFrame:
     return df
 
 
+
+
+def study_row_wide(r: pd.Series) -> dict:
+    """Devuelve una fila con metadatos + TODAS las variables como columnas.
+    Esta es la hoja principal para análisis: no obliga al usuario a buscar las variables en otra pestaña.
+    """
+    meta_cols = ["id", "created_at", "username", "patient_code", "study_date", "condition_label", "source_name", "page_number", "medication", "observations", "notes"]
+    out = {c: r.get(c, "") for c in meta_cols if c in r.index}
+    try:
+        raw_vars = pd.read_json(io.StringIO(r.get("variables_json", ""))) if r.get("variables_json") else pd.DataFrame()
+    except Exception:
+        raw_vars = pd.DataFrame()
+    vars_df = normalize_variables_for_export(raw_vars)
+    value_map = dict(zip(vars_df["codigo"].astype(str), vars_df["valor"]))
+    state_map = dict(zip(vars_df["codigo"].astype(str), vars_df["estado"]))
+    for code in VARIABLE_ORDER:
+        out[code] = value_map.get(code, np.nan)
+    # columnas auxiliares de auditoría: cuántas variables detectadas/cargadas
+    out["n_variables_con_valor"] = int(pd.Series([out.get(c, np.nan) for c in VARIABLE_ORDER]).notna().sum())
+    out["n_variables_totales"] = len(VARIABLE_ORDER)
+    out["variables_con_valor"] = ", ".join([c for c in VARIABLE_ORDER if pd.notna(out.get(c, np.nan))])
+    return out
+
+
+def studies_wide_df(scope_user: dict | None = None) -> pd.DataFrame:
+    """Tabla principal visible y exportable: cada estudio en una fila + todas las variables CGI."""
+    df = studies_df(scope_user)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "created_at", "username", "patient_code", "study_date", "condition_label", "source_name", "page_number", "medication", "observations", "notes"] + VARIABLE_ORDER + ["n_variables_con_valor", "n_variables_totales", "variables_con_valor"])
+    rows = [study_row_wide(r) for _, r in df.iterrows()]
+    return pd.DataFrame(rows)
+
 def cursor_df(scope_user: dict | None = None) -> pd.DataFrame:
     con = connect()
     q = "SELECT * FROM cursor_corrections"
@@ -1122,7 +1154,9 @@ def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
             pd.DataFrame(columns=["study_id", "created_at", "username", "patient_code", "study_date", "condition_label"] + VARIABLE_ORDER).to_excel(writer, index=False, sheet_name="variables_ancho_todas")
             pd.DataFrame(columns=["study_id", "created_at", "username", "patient_code", "condition_label"] + [v["codigo"] for v in VARIABLES if v["categoria"] in ["Dinámica de fluidos", "Postcarga / vascular", "Contractilidad", "Función cardíaca", "Volemia / fluidos", "Acoplamiento", "Tiempos sistólicos"]]).to_excel(writer, index=False, sheet_name="hemodinamicas")
         else:
-            base = df.drop(columns=["variables_json"], errors="ignore")
+            # Hoja principal: metadatos + TODAS las variables como columnas.
+            # Así, al abrir el Excel, el usuario no ve solo los datos administrativos.
+            base = pd.DataFrame([study_row_wide(r) for _, r in df.iterrows()])
             base.to_excel(writer, index=False, sheet_name="estudios")
             long_rows = []
             wide_rows = []
@@ -1341,39 +1375,4 @@ def app_main() -> None:
                     deltas = [abs(manual[c]["x"] - auto[c]["x"]) for c in CURSORS]
                     metrics = {"error_medio_px": float(np.mean(deltas)), "puntos_dzdt": len(dzdt), "puntos_ecg": len(ecg), "puntos_fono": len(fono)}
                     conclusion = "Corrección opcional de cursores realizada con dZ/dt arriba, ECG medio y fonocardiograma abajo."
-                    if st.button("Guardar corrección opcional de cursores", type="primary"):
-                        cid = save_cursor_correction(user, study_id2, patient_code2, source2, int(page2), rois, auto, manual, guide, metrics, conclusion)
-                        st.success(f"Corrección guardada con ID {cid}.")
-            except Exception as exc:
-                st.error(f"Falló el módulo opcional de curvas: {exc}")
-                st.exception(exc)
-        else:
-            st.info("Suba un archivo o use la última hoja cargada en el módulo principal.")
-
-    with tab3:
-        st.subheader("Mis estudios guardados")
-        df = studies_df(user)
-        st.dataframe(df.drop(columns=["variables_json"], errors="ignore"), use_container_width=True)
-        st.download_button("Descargar mi Excel", data=export_excel(user, only_current_user=True), file_name=f"cgi_excel_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    with tab4:
-        if user.get("role") != "admin":
-            st.warning("Solo el administrador puede acceder a todos los registros.")
-        else:
-            st.subheader("Administrador: todos los usuarios y todos los Excel")
-            con = connect()
-            udf = pd.read_sql_query("SELECT id,username,full_name,matricula,provincia,role,active,created_at FROM users ORDER BY created_at DESC", con)
-            con.close()
-            st.dataframe(udf, use_container_width=True)
-            all_df = studies_df(None)
-            st.dataframe(all_df.drop(columns=["variables_json"], errors="ignore"), use_container_width=True)
-            st.download_button("Descargar Excel administrador completo", data=export_excel(user, only_current_user=False), file_name="cgi_excel_administrador_todos_los_usuarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-if __name__ == "__main__":
-    try:
-        app_main()
-    except Exception as exc:
-        css()
-        st.error("La aplicación encontró un error controlado.")
-        st.code(traceback.format_exc())
+                    if st.button
