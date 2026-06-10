@@ -491,6 +491,62 @@ def complete_derived_variables(df: pd.DataFrame) -> None:
         set_df_value(df, "AC", val, "derivado Ea/Ees/revisar")
         set_df_value(df, "EA_EES", val, "derivado Ea/Ees/revisar")
 
+    # Antropometría derivada para indexación y exportación.
+    peso = get_df_value(df, "PESO")
+    talla = get_df_value(df, "TALLA")
+    imc = get_df_value(df, "IMC")
+    if not pd.isna(talla):
+        talla_cm = talla * 100.0 if talla < 3 else talla
+    else:
+        talla_cm = np.nan
+    if pd.isna(get_df_value(df, "TALLA")) is False and not pd.isna(talla_cm):
+        # Normaliza a centímetros si el PDF trajo metros, por ejemplo 1.70.
+        set_df_value(df, "TALLA", talla_cm, "normalizado cm/revisar")
+    if pd.isna(imc) and not pd.isna(peso) and not pd.isna(talla_cm) and talla_cm > 0:
+        h_m = talla_cm / 100.0
+        set_df_value(df, "IMC", peso / (h_m * h_m), "derivado peso/talla/revisar")
+    if pd.isna(peso) and not pd.isna(imc) and not pd.isna(talla_cm) and talla_cm > 0:
+        h_m = talla_cm / 100.0
+        set_df_value(df, "PESO", imc * h_m * h_m, "derivado IMC/talla/revisar")
+    if pd.isna(get_df_value(df, "BSA")) and not pd.isna(peso) and not pd.isna(talla_cm) and peso > 0 and talla_cm > 0:
+        # Fórmula de Mosteller: BSA = sqrt(talla(cm) * peso(kg) / 3600).
+        set_df_value(df, "BSA", float(np.sqrt((talla_cm * peso) / 3600.0)), "derivado Mosteller/revisar")
+
+
+def parse_anthropometry_from_text(text: str, df: pd.DataFrame) -> None:
+    """Extrae peso, talla, IMC y superficie corporal de textos variables del informe.
+    No usa la letra T aislada para talla, porque en Exxer puede significar distancia de electrodos.
+    """
+    if not text:
+        return
+    clean = re.sub(r"[\t\r\n]+", " ", text)
+    clean = re.sub(r"\s+", " ", clean)
+    patterns = {
+        "PESO": [r"\bPeso\s*[:=]?\s*(\d{2,3}(?:[\.,]\d+)?)\s*(?:kg|kilos)?\b"],
+        "TALLA": [
+            r"\bTalla\s*[:=]?\s*(\d{1,3}(?:[\.,]\d+)?)\s*(?:cm|m|mts|metros)?\b",
+            r"\bAltura\s*[:=]?\s*(\d{1,3}(?:[\.,]\d+)?)\s*(?:cm|m|mts|metros)?\b",
+            r"\bEstatura\s*[:=]?\s*(\d{1,3}(?:[\.,]\d+)?)\s*(?:cm|m|mts|metros)?\b",
+        ],
+        "IMC": [r"\bIMC\s*[:=]?\s*(\d{1,2}(?:[\.,]\d+)?)\b", r"\bBMI\s*[:=]?\s*(\d{1,2}(?:[\.,]\d+)?)\b"],
+        "BSA": [
+            r"\bBSA\s*[:=]?\s*(\d(?:[\.,]\d+)?)\b",
+            r"Superficie\s+corporal\s*[:=]?\s*(\d(?:[\.,]\d+)?)\b",
+            r"\bSC\s*[:=]?\s*(\d(?:[\.,]\d+)?)\b",
+        ],
+    }
+    for code, pats in patterns.items():
+        if not pd.isna(get_df_value(df, code)):
+            continue
+        for pat in pats:
+            m = re.search(pat, clean, re.I)
+            if m:
+                val = to_float(m.group(1))
+                if code == "TALLA" and not pd.isna(val) and val < 3:
+                    val = val * 100.0
+                if variable_plausible(code, val):
+                    set_df_value(df, code, val, "extraído/antropometría/revisar")
+                    break
 
 
 def variable_plausible(code: str, value: float) -> bool:
@@ -772,6 +828,7 @@ def parse_report_text(text: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     parse_variable_lines(spatial_lines, df)
     parse_right_panel_text(text, df)
     fallback_sequence_parse(text, df)
+    parse_anthropometry_from_text(text, df)
 
     joined = "\n".join(raw_lines)
     flat = re.sub(r"\s+", " ", joined)
@@ -1291,6 +1348,32 @@ def app_main() -> None:
                     notes = st.text_input("Notas internas del operador", key="notes")
                 observations = st.text_area("Observaciones del informe", value=meta.get("observations", ""), height=80, key="obs")
 
+                st.subheader("Antropometría para indexación")
+                st.caption("Se exporta en el Excel y permite calcular IMC y superficie corporal. Si el PDF no la trae, cargarla manualmente aquí.")
+                complete_derived_variables(parsed_df)
+                p0 = get_df_value(parsed_df, "PESO")
+                t0 = get_df_value(parsed_df, "TALLA")
+                i0 = get_df_value(parsed_df, "IMC")
+                b0 = get_df_value(parsed_df, "BSA")
+                ant1, ant2, ant3, ant4 = st.columns(4)
+                with ant1:
+                    peso_in = st.number_input("Peso (kg)", min_value=0.0, max_value=250.0, value=float(p0) if not pd.isna(p0) else 0.0, step=0.1, key="ant_peso")
+                with ant2:
+                    talla_in = st.number_input("Talla (cm)", min_value=0.0, max_value=230.0, value=float(t0) if not pd.isna(t0) else 0.0, step=0.5, key="ant_talla")
+                with ant3:
+                    imc_in = st.number_input("IMC (kg/m²)", min_value=0.0, max_value=80.0, value=float(i0) if not pd.isna(i0) else 0.0, step=0.1, key="ant_imc")
+                with ant4:
+                    bsa_in = st.number_input("Superficie corporal/BSA (m²)", min_value=0.0, max_value=3.5, value=float(b0) if not pd.isna(b0) else 0.0, step=0.01, key="ant_bsa")
+                if peso_in > 0:
+                    set_df_value(parsed_df, "PESO", peso_in, "manual/antropometría")
+                if talla_in > 0:
+                    set_df_value(parsed_df, "TALLA", talla_in, "manual/antropometría")
+                if imc_in > 0:
+                    set_df_value(parsed_df, "IMC", imc_in, "manual/antropometría")
+                if bsa_in > 0:
+                    set_df_value(parsed_df, "BSA", bsa_in, "manual/antropometría")
+                complete_derived_variables(parsed_df)
+
                 st.subheader("Variables del informe")
                 st.caption("Revise y corrija los valores. Los campos exportados usan el código anónimo del paciente y el usuario operador.")
                 edited = st.data_editor(
@@ -1303,7 +1386,7 @@ def app_main() -> None:
                         "categoria": st.column_config.TextColumn("Categoría", disabled=True),
                         "unidad": st.column_config.TextColumn("Unidad", disabled=True),
                         "valor": st.column_config.NumberColumn("Valor corregido", format="%.3f"),
-                        "estado": st.column_config.SelectboxColumn("Estado", options=["extraído/revisar", "manual/revisar", "validado"]),
+                        "estado": st.column_config.SelectboxColumn("Estado", options=["extraído/revisar", "extraído/antropometría/revisar", "manual/antropometría", "derivado peso/talla/revisar", "derivado IMC/talla/revisar", "derivado Mosteller/revisar", "manual/revisar", "validado"]),
                     },
                     key="vars_editor",
                 )
