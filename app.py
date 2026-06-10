@@ -1375,4 +1375,43 @@ def app_main() -> None:
                     deltas = [abs(manual[c]["x"] - auto[c]["x"]) for c in CURSORS]
                     metrics = {"error_medio_px": float(np.mean(deltas)), "puntos_dzdt": len(dzdt), "puntos_ecg": len(ecg), "puntos_fono": len(fono)}
                     conclusion = "Corrección opcional de cursores realizada con dZ/dt arriba, ECG medio y fonocardiograma abajo."
-                    if st.button
+                    if st.button("Guardar corrección opcional de cursores", type="primary"):
+                        cid = save_cursor_correction(user, study_id2, patient_code2, source2, int(page2), rois, auto, manual, guide, metrics, conclusion)
+                        st.success(f"Corrección guardada con ID {cid}.")
+            except Exception as exc:
+                st.error(f"Falló el módulo opcional de curvas: {exc}")
+                st.exception(exc)
+        else:
+            st.info("Suba un archivo o use la última hoja cargada en el módulo principal.")
+
+    with tab3:
+        st.subheader("Mis estudios guardados")
+        df = studies_df(user)
+        df_wide = studies_wide_df(user)
+        st.caption("Vista principal: cada fila es un estudio y las columnas incluyen TODAS las variables CGI, incluidas las hemodinámicas.")
+        st.dataframe(df_wide, use_container_width=True)
+        st.download_button("Descargar mi Excel completo", data=export_excel(user, only_current_user=True), file_name=f"cgi_excel_completo_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    with tab4:
+        if user.get("role") != "admin":
+            st.warning("Solo el administrador puede acceder a todos los registros.")
+        else:
+            st.subheader("Administrador: todos los usuarios y todos los Excel")
+            con = connect()
+            udf = pd.read_sql_query("SELECT id,username,full_name,matricula,provincia,role,active,created_at FROM users ORDER BY created_at DESC", con)
+            con.close()
+            st.dataframe(udf, use_container_width=True)
+            all_df = studies_df(None)
+            all_wide = studies_wide_df(None)
+            st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
+            st.dataframe(all_wide, use_container_width=True)
+            st.download_button("Descargar Excel administrador completo", data=export_excel(user, only_current_user=False), file_name="cgi_excel_administrador_todos_los_usuarios_COMPLETO.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+if __name__ == "__main__":
+    try:
+        app_main()
+    except Exception as exc:
+        css()
+        st.error("La aplicación encontró un error controlado.")
+        st.code(traceback.format_exc())
