@@ -20,10 +20,10 @@ except Exception:
     fitz = None
 
 APP_TITLE = "App para Repositorio y aprendizaje en Cardiografía de Impedancia"
-APP_SUBTITLE = "Corrección didáctica de cursores B, C, X e Y con ECG + dZ/dt + fonocardiograma"
+APP_SUBTITLE = "Corrección didáctica de QRS inicial, B, C, X e Y con ECG + dZ/dt + fonocardiograma"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
 DB_PATH = Path("cgi_cursores.sqlite3")
-CURSORS = ["B", "C", "X", "Y"]
+CURSORS = ["QRS", "B", "C", "X", "Y"]
 
 st.set_page_config(page_title="CGI cursores", page_icon="🫀", layout="wide")
 
@@ -344,13 +344,59 @@ def near_y(df: pd.DataFrame, xval: float) -> float:
     return float(df.iloc[idx]["yn"])
 
 
+def _estimate_qrs_onset(ecg: pd.DataFrame) -> tuple[float, float]:
+    """Estima el comienzo del QRS sobre ECG.
+
+    La detección automática es solo una propuesta didáctica. Busca el pico principal del QRS
+    y retrocede hasta el punto donde la señal se separa de su línea de base o aparece la
+    máxima pendiente inicial. El médico/aprendiz debe corregirlo manualmente.
+    """
+    if ecg.empty or len(ecg) < 8:
+        return np.nan, np.nan
+    e = ecg.dropna().copy()
+    x = e["x"].to_numpy(float)
+    y = smooth(e["yn"].to_numpy(float), max(3, int(len(e) * 0.01)))
+    if len(x) < 8:
+        return np.nan, np.nan
+
+    # Pico QRS aproximado: máximo absoluto respecto de una línea de base robusta.
+    baseline = float(np.nanmedian(y))
+    dev = np.abs(y - baseline)
+    peak_i = int(np.nanargmax(dev))
+
+    # Ventana previa al pico. Se busca el primer despegue claro de la línea de base.
+    left = max(0, peak_i - max(8, int(len(y) * 0.22)))
+    pre = y[left:peak_i + 1]
+    if len(pre) < 4:
+        return float(x[max(0, peak_i - 2)]), float(x[peak_i])
+
+    pre_dev = np.abs(pre - baseline)
+    thr = max(float(np.nanpercentile(dev, 75) * 0.18), float(np.nanstd(y) * 0.35), 0.025)
+    candidates = np.where(pre_dev > thr)[0]
+    if len(candidates):
+        onset_i = left + int(candidates[0])
+    else:
+        # Respaldo: máxima pendiente en la porción previa.
+        grad = np.abs(np.gradient(pre))
+        onset_i = left + int(np.nanargmax(grad))
+
+    # Ajuste conservador: no dejarlo pegado al pico.
+    onset_i = min(onset_i, max(0, peak_i - 2))
+    return float(x[onset_i]), float(x[peak_i])
+
+
 def detect(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, xmin: float, xmax: float, fono_line: float) -> Tuple[dict, dict]:
-    auto = {c: {"x": float(xmin + (i + 1) * (xmax - xmin) / 5), "y": 0.5} for i, c in enumerate(CURSORS)}
-    guia = {"qrs": np.nan, "s1": np.nan, "s2": np.nan, "fono_line": float(fono_line)}
+    # Cinco cursores: QRS inicial sobre ECG + B/C/X/Y sobre dZ/dt.
+    auto = {c: {"x": float(xmin + (i + 1) * (xmax - xmin) / 6), "y": 0.5} for i, c in enumerate(CURSORS)}
+    guia = {"qrs_inicio": np.nan, "qrs_pico": np.nan, "s1": np.nan, "s2": np.nan, "fono_line": float(fono_line)}
+
     if not ecg.empty:
-        e = ecg.dropna()
-        if len(e):
-            guia["qrs"] = float(e.iloc[int(np.nanargmax(e["yn"].to_numpy(float)))]["x"])
+        qrs_inicio, qrs_pico = _estimate_qrs_onset(ecg)
+        guia["qrs_inicio"] = qrs_inicio
+        guia["qrs_pico"] = qrs_pico
+        if np.isfinite(qrs_inicio):
+            auto["QRS"] = {"x": float(qrs_inicio), "y": near_y(ecg, float(qrs_inicio))}
+
     if not fono.empty:
         f = fono.dropna()
         y = smooth(f["yn"].to_numpy(float), max(5, int(len(f) * 0.025)))
@@ -370,16 +416,28 @@ def detect(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, xmin: floa
             guia["s1"] = centers[0]
         if len(centers) >= 2:
             guia["s2"] = centers[1]
+
     if not dzdt.empty and len(dzdt) >= 5:
         d = dzdt.dropna()
         x = d["x"].to_numpy(float)
         y = smooth(d["yn"].to_numpy(float), max(5, int(len(d) * 0.025)))
         ci = int(np.nanargmax(y))
+
+        # B se estima después del inicio QRS y antes de C; respaldo por pendiente.
         bi = max(0, ci - max(3, len(y) // 10))
-        if ci > 5:
+        left_start = 0
+        if np.isfinite(guia.get("qrs_inicio", np.nan)):
+            left_start = int(np.searchsorted(x, guia["qrs_inicio"]))
+            left_start = min(max(0, left_start), max(0, ci - 3))
+        if ci > left_start + 5:
+            seg = y[left_start:ci]
+            grad = np.gradient(seg)
+            bi = left_start + int(np.nanargmax(grad))
+        elif ci > 5:
             seg = y[:ci]
             grad = np.gradient(seg)
             bi = int(np.nanargmax(grad))
+
         xi = min(len(y) - 1, ci + max(3, len(y) // 8))
         post = y[ci + 1:]
         if len(post) >= 4:
@@ -398,10 +456,16 @@ def cursor_table(auto: dict, manual: dict, guia: dict) -> pd.DataFrame:
     for c in CURSORS:
         mx = float(manual[c]["x"])
         ax = float(auto[c]["x"])
-        if c == "B": crit = "Pie de ascenso de dZ/dt, después del QRS."
-        elif c == "C": crit = "Pico sistólico principal de dZ/dt."
-        elif c == "X": crit = "Nadir sistólico; validar con S2 del fonocardiograma."
-        else: crit = "Rebote diastólico posterior si es visible."
+        if c == "QRS":
+            crit = "Comienzo del QRS en ECG: inicio de la deflexión rápida, antes del pico QRS. Referencia para ubicar B."
+        elif c == "B":
+            crit = "Pie de ascenso de dZ/dt, después del comienzo del QRS."
+        elif c == "C":
+            crit = "Pico sistólico principal de dZ/dt."
+        elif c == "X":
+            crit = "Nadir sistólico; validar con S2 del fonocardiograma."
+        else:
+            crit = "Rebote diastólico posterior si es visible."
         rows.append({"Cursor": c, "Auto_x": round(ax, 1), "Manual_x": round(mx, 1), "Delta_px": round(mx - ax, 1), "Criterio": crit})
     return pd.DataFrame(rows)
 
@@ -413,7 +477,7 @@ def plot_signals(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, auto
     ax.plot(x, interp(dzdt, x) + 1.2, linewidth=2.1, label="dZ/dt")
     ax.plot(x, interp(fono, x), linewidth=1.6, label="Fonocardiograma")
     ax.hlines(float(guia.get("fono_line", 0.55)), xmin, xmax, linestyles="--", linewidth=1.2, label="Línea horizontal fono")
-    for key, txt, yy in [("qrs", "QRS", 3.45), ("s1", "S1", 0.88), ("s2", "S2", 0.88)]:
+    for key, txt, yy in [("qrs_inicio", "QRS inicio auto", 3.45), ("qrs_pico", "QRS pico", 3.28), ("s1", "S1", 0.88), ("s2", "S2", 0.88)]:
         val = guia.get(key, np.nan)
         if np.isfinite(val):
             ax.axvline(float(val), linestyle="-.", linewidth=1.1)
@@ -421,7 +485,8 @@ def plot_signals(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, auto
     for c in CURSORS:
         ax.axvline(float(auto[c]["x"]), linestyle=":", linewidth=1.2)
         ax.axvline(float(manual[c]["x"]), linestyle="--", linewidth=2.0)
-        ax.text(float(manual[c]["x"]), 1.05, c, rotation=90, ha="center", va="bottom", fontsize=11, fontweight="bold")
+        label_y = 3.08 if c == "QRS" else 1.05
+        ax.text(float(manual[c]["x"]), label_y, c, rotation=90, ha="center", va="bottom", fontsize=11, fontweight="bold")
     ax.set_yticks([0.5, 1.7, 2.9])
     ax.set_yticklabels(["Fono", "dZ/dt", "ECG"])
     ax.set_xlim(xmin, xmax)
@@ -458,7 +523,7 @@ def main() -> None:
     apply_css()
     init_db()
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El área inicial queda configurada en el panel derecho del informe marcado en amarillo, excluyendo la columna de texto/valores para que la forma digitalizada se parezca a la original: dZ/dt arriba, ECG al medio y fonocardiograma abajo. El ECG orienta QRS/B, dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El área inicial queda configurada en el panel derecho del informe marcado en amarillo, excluyendo la columna de texto/valores para que la forma digitalizada se parezca a la original: dZ/dt arriba, ECG al medio y fonocardiograma abajo. El ECG permite marcar manualmente el comienzo del QRS y orienta B; dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
 
     tab1, tab2 = st.tabs(["Corrección", "Histórico"])
 
@@ -538,10 +603,10 @@ def main() -> None:
                 return
 
             auto, guia = detect(ecg, dzdt, fono, xmin, xmax, fono_line)
-            st.markdown("<div class='ok'><b>Listo:</b> ahora corrija manualmente B, C, X e Y.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='ok'><b>Listo:</b> ahora corrija manualmente QRS inicial, B, C, X e Y.</div>", unsafe_allow_html=True)
 
             manual = {}
-            cols = st.columns(4)
+            cols = st.columns(len(CURSORS))
             for i, cur in enumerate(CURSORS):
                 with cols[i]:
                     default = int(round(float(auto[cur]["x"])))
@@ -554,7 +619,7 @@ def main() -> None:
             st.dataframe(tab, use_container_width=True)
             mae = float(pd.to_numeric(tab["Delta_px"], errors="coerce").abs().mean())
             conclusion = (
-                "Corrección didáctica integrada. B se valida después del QRS y en el pie de ascenso de dZ/dt; "
+                "Corrección didáctica integrada. Se agregó el cursor QRS para marcar el comienzo del QRS en ECG. B se valida después de ese QRS inicial y en el pie de ascenso de dZ/dt; "
                 "C corresponde al pico sistólico; X al nadir sistólico en relación con S2; Y al rebote diastólico si es visible. "
                 f"Error medio automático-manual: {mae:.1f} px."
             )
