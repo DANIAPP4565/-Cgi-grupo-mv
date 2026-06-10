@@ -139,12 +139,29 @@ def open_upload(uploaded) -> Tuple[Image.Image, int, str]:
     return Image.open(io.BytesIO(raw)).convert("RGB"), 1, uploaded.name
 
 
-def default_rois(w: int, h: int) -> Dict[str, Dict[str, int]]:
+def default_rois(w: int, h: int, preset: str = "panel_derecho") -> Dict[str, Dict[str, int]]:
+    """Recortes iniciales.
+
+    preset="panel_derecho" corrige el error señalado: la digitalización debe tomarse
+    del panel pequeño de la derecha del informe Exxer, marcado en amarillo por el usuario,
+    no de la tira larga inferior ni de las tablas.
+    """
+    if preset == "panel_derecho":
+        # Área amarilla derecha del informe: x 72-97 % de la página.
+        x0, x1 = int(w * 0.725), int(w * 0.965)
+        return {
+            # En ese panel la curva dZ/dt está arriba, el ECG en el medio y el fono abajo.
+            "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.135), "y1": int(h * 0.405)},
+            "ecg":  {"x0": x0, "x1": x1, "y0": int(h * 0.440), "y1": int(h * 0.610)},
+            "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.605), "y1": int(h * 0.730)},
+        }
+
+    # Opción alternativa para trazados largos inferiores, si se quiere entrenar sobre toda la tira.
     x0, x1 = int(w * 0.05), int(w * 0.94)
     return {
-        "ecg": {"x0": x0, "x1": x1, "y0": int(h * 0.50), "y1": int(h * 0.61)},
-        "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.61), "y1": int(h * 0.76)},
-        "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.76), "y1": int(h * 0.89)},
+        "ecg": {"x0": x0, "x1": x1, "y0": int(h * 0.74), "y1": int(h * 0.84)},
+        "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.84), "y1": int(h * 0.98)},
+        "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.60), "y1": int(h * 0.72)},
     }
 
 
@@ -358,7 +375,7 @@ def main() -> None:
     apply_css()
     init_db()
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El ECG orienta QRS/B, dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El área inicial queda configurada en el panel derecho del informe marcado en amarillo: dZ/dt arriba, ECG al medio y fonocardiograma abajo. El ECG orienta QRS/B, dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
 
     tab1, tab2 = st.tabs(["Corrección", "Histórico"])
 
@@ -377,8 +394,18 @@ def main() -> None:
         else:
             img, pagina, archivo = open_upload(uploaded)
             w, h = img.size
-            base = default_rois(w, h)
-            st.image(draw_rois(img, base), caption="Recortes iniciales sugeridos", use_container_width=True)
+            preset = st.selectbox(
+                "Área inicial de digitalización",
+                [
+                    "Panel derecho marcado en amarillo / informe Exxer",
+                    "Tiras largas inferiores",
+                ],
+                index=0,
+                help="Para este caso use el panel derecho: allí están sincronizados dZ/dt, ECG y fono.",
+            )
+            preset_key = "panel_derecho" if preset.startswith("Panel derecho") else "tiras_inferiores"
+            base = default_rois(w, h, preset_key)
+            st.image(draw_rois(img, base), caption="Recortes iniciales sugeridos sobre el área correcta", use_container_width=True)
 
             rois = {}
             with st.expander("Ajustar recortes", expanded=True):
