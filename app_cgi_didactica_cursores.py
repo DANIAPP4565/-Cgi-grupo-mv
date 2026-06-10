@@ -541,7 +541,7 @@ with tab1:
                 y_max = st.slider(f"Y máx {labels[key]}", min(y_min + 2, h), h, base["y_max"], key=f"{key}_y1")
             rois[key] = clamp_roi({"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}, w, h)
 
-    st.image(draw_rois(img, rois), caption="Vista previa de recortes: verde ECG, azul dZ/dt, naranja fonocardiograma", use_container_width=True)
+    st.image(draw_rois(img, rois), caption="Vista previa de recortes: verde ECG, azul dZ/dt, naranja fonocardiograma", use_column_width=True)
 
     with st.expander("2. Parámetros didácticos de detección", expanded=True):
         c1, c2, c3 = st.columns(3)
@@ -594,7 +594,7 @@ with tab1:
                 manual[c] = {"x": float(val), "y": nearest_y(dzdt, float(val))}
 
     chart = plot_three_signals(ecg, dzdt, fono, auto, manual, guide, x_min_common, x_max_common, "Corrección integrada ECG + dZ/dt + fonocardiograma")
-    st.image(chart, caption="Vista didáctica sincronizada de las tres señales y cursores corregidos", use_container_width=True)
+    st.image(chart.getvalue(), caption="Vista didáctica sincronizada de las tres señales y cursores corregidos", use_column_width=True)
 
     cursor_df = build_cursor_table(auto, manual, guide)
     metrics, conclusion = make_conclusion(cursor_df, guide)
@@ -638,4 +638,4 @@ with tab2:
         </div>
         """,
         unsafe_allow_html=True,
-    )
+ 
