@@ -434,11 +434,29 @@ def first_number_in(s: str):
 
 
 def set_df_value(df: pd.DataFrame, code: str, val, state: str = "extraído/revisar") -> None:
+    """Carga un valor en la tabla, protegiendo contra falsos positivos del OCR/PDF.
+
+    Caso crítico corregido: el rótulo Z0 contiene el dígito 0. Si se usa el
+    primer número de la línea, puede exportarse 0 en lugar de la impedancia
+    basal real, por ejemplo 23.0 o 31.1 ohm.
+    """
     if pd.isna(val):
         return
+    try:
+        fval = float(val)
+    except Exception:
+        return
+    # Validación general de rango fisiológico/técnico cuando la función ya está disponible.
+    vf = globals().get("variable_plausible")
+    if callable(vf):
+        try:
+            if not vf(code, fval):
+                return
+        except Exception:
+            pass
     idx = df.index[df["codigo"] == code]
     if len(idx):
-        df.loc[idx[0], "valor"] = float(val)
+        df.loc[idx[0], "valor"] = fval
         df.loc[idx[0], "estado"] = state
 
 
@@ -674,11 +692,11 @@ def parse_words_by_position(words: List[Dict[str, float]], df: pd.DataFrame, met
             nums = [x for x in nums if variable_plausible("DZDT_MAX", x)]
             if nums:
                 set_df_value(df, "DZDT_MAX", nums[-1], "extraído/pdf-coordenadas/revisar")
-        if re.search(r"\bZ0\b|\bZO\b", txt, re.I):
-            nums = [to_float(x) for x in re.findall(r"-?\d+(?:[\.,]\d+)?", txt)]
-            nums = [x for x in nums if variable_plausible("Z0", x)]
-            if nums:
-                set_df_value(df, "Z0", nums[-1], "extraído/pdf-coordenadas/revisar")
+        if re.search(r"\bZ\s*[0O]\b", txt, re.I):
+            # No tomar el 0 del rótulo Z0. Se toma exclusivamente el número posterior a Z0/ZO.
+            mz0 = re.search(r"\bZ\s*[0O]\b\s*[:=]?\s*(\d+(?:[\.,]\d+)?)", txt, re.I)
+            if mz0:
+                set_df_value(df, "Z0", to_float(mz0.group(1)), "extraído/pdf-coordenadas/revisar")
         if re.search(r"Dist\.?\s*e/?\s*electrodos|electrodos|D\s*:", txt, re.I):
             md = re.search(r"\bD\s*[:=]\s*(\d+(?:[\.,]\d+)?)", txt, re.I)
             mt = re.search(r"\bT\s*[:=]\s*(\d+(?:[\.,]\d+)?)", txt, re.I)
@@ -754,10 +772,18 @@ def parse_variable_lines(lines: List[str], df: pd.DataFrame) -> None:
                 continue
         for code, keys in aliases.items():
             if any(re.search(r"(^|\s)" + re.escape(k) + r"(\b|\s)", line, re.I) for k in keys):
-                # tomar números de la línea; el primero suele ser el VALOR del estudio.
-                nums = re.findall(r"-?\d+(?:[\.,]\d+)?", line)
+                # Z0 requiere tratamiento especial: el dígito del rótulo NO es el valor.
+                if code == "Z0":
+                    mz0 = re.search(r"\bZ\s*[0O]\b\s*[:=]?\s*(\d+(?:[\.,]\d+)?)", line, re.I)
+                    if mz0:
+                        set_df_value(df, "Z0", to_float(mz0.group(1)), "extraído/línea-Z0/revisar")
+                        used_line_idx.add(i)
+                    break
+                # Tomar el primer número plausible de la línea, evitando referencias de barras o rótulos.
+                nums = [to_float(x) for x in re.findall(r"-?\d+(?:[\.,]\d+)?", line)]
+                nums = [x for x in nums if variable_plausible(code, x)]
                 if nums:
-                    set_df_value(df, code, to_float(nums[0]))
+                    set_df_value(df, code, nums[0])
                     used_line_idx.add(i)
                     break
 
@@ -771,7 +797,7 @@ def parse_right_panel_text(text: str, df: pd.DataFrame) -> None:
         "PE": r"\bPE\s*(\d+(?:[\.,]\d+)?)",
         "PPE": r"\bPPE\s*(\d+(?:[\.,]\d+)?)",
         "DZDT_MAX": r"(?:dZ/dt|dz/dt|dZdt|dzdt)\s*(?:Imax|lmax|max)?\s*(\d+(?:[\.,]\d+)?)",
-        "Z0": r"\bZ0\s*(\d+(?:[\.,]\d+)?)",
+        "Z0": r"\bZ\s*[0O]\b\s*[:=]?\s*(\d+(?:[\.,]\d+)?)",
         "DIST_D": r"\bD\s*:\s*(\d+(?:[\.,]\d+)?)\s*cm",
         "DIST_T": r"\bT\s*:\s*(\d+(?:[\.,]\d+)?)\s*cm",
     }
