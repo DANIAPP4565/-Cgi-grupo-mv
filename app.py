@@ -142,15 +142,25 @@ def open_upload(uploaded) -> Tuple[Image.Image, int, str]:
 def default_rois(w: int, h: int, preset: str = "panel_derecho") -> Dict[str, Dict[str, int]]:
     """Recortes iniciales.
 
-    preset="panel_derecho" corrige el error señalado: la digitalización debe tomarse
-    del panel pequeño de la derecha del informe Exxer, marcado en amarillo por el usuario,
-    no de la tira larga inferior ni de las tablas.
+    Punto crítico corregido:
+    - El sector correcto es el panel derecho del informe Exxer.
+    - Pero para digitalizar la forma de la curva NO debe incluirse la columna de texto/valores
+      de la derecha (RR, PE, PPE, Z0, distancia de electrodos), porque esos caracteres se
+      confunden con la señal y deforman el trazado.
     """
-    if preset == "panel_derecho":
-        # Área amarilla derecha del informe: x 72-97 % de la página.
-        x0, x1 = int(w * 0.725), int(w * 0.965)
+    if preset == "panel_recortado":
+        # Cuando el usuario sube una imagen ya recortada del panel derecho.
+        x0, x1 = int(w * 0.03), int(w * 0.70)  # excluye columna de valores/texto de la derecha
         return {
-            # En ese panel la curva dZ/dt está arriba, el ECG en el medio y el fono abajo.
+            "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.035), "y1": int(h * 0.335)},
+            "ecg":  {"x0": x0, "x1": x1, "y0": int(h * 0.365), "y1": int(h * 0.640)},
+            "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.680), "y1": int(h * 0.965)},
+        }
+
+    if preset == "panel_derecho":
+        # Página completa: panel derecho del informe. X final más corto para excluir la columna de valores.
+        x0, x1 = int(w * 0.725), int(w * 0.890)
+        return {
             "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.135), "y1": int(h * 0.405)},
             "ecg":  {"x0": x0, "x1": x1, "y0": int(h * 0.440), "y1": int(h * 0.610)},
             "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.605), "y1": int(h * 0.730)},
@@ -163,7 +173,6 @@ def default_rois(w: int, h: int, preset: str = "panel_derecho") -> Dict[str, Dic
         "dzdt": {"x0": x0, "x1": x1, "y0": int(h * 0.84), "y1": int(h * 0.98)},
         "fono": {"x0": x0, "x1": x1, "y0": int(h * 0.60), "y1": int(h * 0.72)},
     }
-
 
 def clamp_roi(r: Dict[str, int], w: int, h: int) -> Dict[str, int]:
     x0 = int(max(0, min(r["x0"], w - 3)))
@@ -200,53 +209,127 @@ def smooth(y: np.ndarray, window: int = 9) -> np.ndarray:
     return np.convolve(yy, np.ones(window) / window, mode="valid")
 
 
-def make_mask(rgb: np.ndarray, mode: str) -> np.ndarray:
+def make_mask(rgb: np.ndarray, mode: str = "exxer_blue") -> np.ndarray:
+    """Máscara para trazos impresos Exxer.
+
+    En estos informes ECG, dZ/dt y fonocardiograma suelen estar impresos en azul/violeta.
+    La versión anterior buscaba ECG verde y fono naranja, por eso terminaba tomando grilla,
+    texto o bordes y deformaba la señal. Esta función prioriza píxeles azulados/oscuros y
+    descarta la grilla clara.
+    """
     r = rgb[:, :, 0].astype(int)
     g = rgb[:, :, 1].astype(int)
     b = rgb[:, :, 2].astype(int)
-    if mode == "ecg":
-        mask = (g > r + 8) & (g > b + 3) & (r < 230) & (b < 230)
-    elif mode == "dzdt":
-        mask = (b > r + 4) & (b > g + 1) & (r < 235) & (g < 235)
-    elif mode == "fono":
-        mask = (r > g + 4) & (g > b + 3) & (r > 100) & (b < 210)
-    else:
-        gray = np.array(ImageOps.grayscale(Image.fromarray(rgb.astype("uint8"))))
-        mask = gray <= np.percentile(gray, 35)
-    if int(mask.sum()) < 50:
-        gray = np.array(ImageOps.grayscale(Image.fromarray(rgb.astype("uint8"))))
-        mask = gray <= np.percentile(gray, 30)
-    return mask
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+    maxc = np.maximum.reduce([r, g, b])
+    minc = np.minimum.reduce([r, g, b])
+    sat = maxc - minc
+
+    # Trazo azul/violeta de la señal: relativamente oscuro, con B dominante o parecido.
+    blue_line = (gray < 210) & (b >= r - 2) & (b >= g - 5) & (sat > 4)
+    # Respaldo para segmentos más oscuros/antialiasing, evitando grilla clara.
+    dark_line = (gray < 135) & (b >= r - 18) & (b >= g - 18)
+    return blue_line | dark_line
 
 
-def digitize(img: Image.Image, roi: Dict[str, int], mode: str) -> pd.DataFrame:
+def _contiguous_groups(rows: np.ndarray) -> list[tuple[int, int]]:
+    if len(rows) == 0:
+        return []
+    groups: list[tuple[int, int]] = []
+    a = int(rows[0])
+    p = int(rows[0])
+    for rr in rows[1:]:
+        rr = int(rr)
+        if rr - p > 2:
+            groups.append((a, p))
+            a = rr
+        p = rr
+    groups.append((a, p))
+    return groups
+
+
+def _robust_normalize_from_y(y_pixel: np.ndarray, y0: int, y1: int) -> np.ndarray:
+    """Convierte y de píxel a amplitud normalizada conservando mejor la forma.
+
+    Usa percentiles para que bordes, texto o pequeñas marcas verticales no achaten la curva.
+    """
+    amp = float(y1) - np.asarray(y_pixel, dtype=float)
+    lo, hi = np.nanpercentile(amp, [3, 97]) if len(amp) >= 10 else (np.nanmin(amp), np.nanmax(amp))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.nanmin(amp)), float(np.nanmax(amp))
+    amp = np.clip(amp, lo, hi)
+    den = hi - lo
+    if den <= 0:
+        return np.zeros_like(amp, dtype=float)
+    return (amp - lo) / den
+
+
+def digitize(img: Image.Image, roi: Dict[str, int], mode: str = "exxer_blue") -> pd.DataFrame:
+    """Digitalización por seguimiento de trazo.
+
+    La mejora clave es que no promedia todos los píxeles oscuros de una columna. En cada columna
+    busca grupos finos de píxeles y sigue el grupo más continuo con la columna previa. Así evita
+    deformaciones por texto, números, bordes y grilla.
+    """
     arr = np.asarray(img.convert("RGB"))
     r = clamp_roi(roi, *img.size)
     crop = arr[r["y0"]:r["y1"], r["x0"]:r["x1"], :]
     if crop.size == 0:
         return pd.DataFrame(columns=["x", "y", "yn"])
+
     mask = make_mask(crop, mode)
     ch, cw = mask.shape
-    max_dense = max(5, int(ch * 0.50))
-    xs, ys = [], []
-    for cx in range(cw):
+    xs: list[float] = []
+    ys: list[float] = []
+    last_y: float | None = None
+    missing = 0
+    center = ch / 2.0
+    max_group_height = max(4, int(ch * 0.10))
+
+    # Pequeño margen para evitar bordes del recorte.
+    start_x = max(0, int(cw * 0.01))
+    end_x = min(cw, int(cw * 0.99))
+
+    for cx in range(start_x, end_x):
         rows = np.where(mask[:, cx])[0]
-        if 0 < len(rows) <= max_dense:
-            xs.append(r["x0"] + cx)
-            ys.append(r["y0"] + float(np.median(rows)))
+        if len(rows) == 0:
+            missing += 1
+            continue
+
+        groups = _contiguous_groups(rows)
+        candidates: list[float] = []
+        for a, b in groups:
+            if (b - a + 1) <= max_group_height:
+                candidates.append((a + b) / 2.0)
+        if not candidates:
+            missing += 1
+            continue
+
+        if last_y is None or missing > max(12, int(cw * 0.05)):
+            ref = center if last_y is None else last_y
+            y = min(candidates, key=lambda yy: abs(yy - ref))
+        else:
+            y = min(candidates, key=lambda yy: abs(yy - last_y))
+            # Salto excesivo: suele ser texto, borde o número, no la curva.
+            if abs(y - last_y) > ch * 0.32:
+                missing += 1
+                continue
+
+        xs.append(float(r["x0"] + cx))
+        ys.append(float(r["y0"] + y))
+        last_y = float(y)
+        missing = 0
+
     if len(xs) < 8:
         return pd.DataFrame(columns=["x", "y", "yn"])
-    df = pd.DataFrame({"x": xs, "y": ys}).groupby("x", as_index=False)["y"].median()
-    y = smooth(df["y"].to_numpy(float), max(5, int(len(df) * 0.018)))
-    yn = r["y1"] - y
-    yn = yn - np.nanmin(yn)
-    den = np.nanmax(yn)
-    if den > 0:
-        yn = yn / den
-    df["y"] = y
-    df["yn"] = yn
-    return df
 
+    df = pd.DataFrame({"x": xs, "y": ys}).groupby("x", as_index=False)["y"].median()
+
+    # Suavizado leve: suficiente para quitar pixelado, sin destruir QRS/S1/S2.
+    win = max(3, int(len(df) * 0.006))
+    df["y"] = smooth(df["y"].to_numpy(float), win)
+    df["yn"] = _robust_normalize_from_y(df["y"].to_numpy(float), r["y0"], r["y1"])
+    return df
 
 def interp(df: pd.DataFrame, x: np.ndarray) -> np.ndarray:
     if df.empty or len(df) < 2:
@@ -375,7 +458,7 @@ def main() -> None:
     apply_css()
     init_db()
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El área inicial queda configurada en el panel derecho del informe marcado en amarillo: dZ/dt arriba, ECG al medio y fonocardiograma abajo. El ECG orienta QRS/B, dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='guide'><b>Propósito:</b> entrenar la corrección de cursores sobre una vista sincronizada. El área inicial queda configurada en el panel derecho del informe marcado en amarillo, excluyendo la columna de texto/valores para que la forma digitalizada se parezca a la original: dZ/dt arriba, ECG al medio y fonocardiograma abajo. El ECG orienta QRS/B, dZ/dt define B-C-X-Y y el fonocardiograma aporta referencia S1/S2 con una línea horizontal.</div>", unsafe_allow_html=True)
 
     tab1, tab2 = st.tabs(["Corrección", "Histórico"])
 
@@ -398,12 +481,18 @@ def main() -> None:
                 "Área inicial de digitalización",
                 [
                     "Panel derecho marcado en amarillo / informe Exxer",
+                    "Imagen ya recortada del panel derecho",
                     "Tiras largas inferiores",
                 ],
                 index=0,
-                help="Para este caso use el panel derecho: allí están sincronizados dZ/dt, ECG y fono.",
+                help="Para este caso use el panel derecho. La app excluye la columna de texto/valores de la derecha para conservar la forma de la curva.",
             )
-            preset_key = "panel_derecho" if preset.startswith("Panel derecho") else "tiras_inferiores"
+            if preset.startswith("Panel derecho"):
+                preset_key = "panel_derecho"
+            elif preset.startswith("Imagen ya"):
+                preset_key = "panel_recortado"
+            else:
+                preset_key = "tiras_inferiores"
             base = default_rois(w, h, preset_key)
             st.image(draw_rois(img, base), caption="Recortes iniciales sugeridos sobre el área correcta", use_container_width=True)
 
@@ -429,9 +518,9 @@ def main() -> None:
             st.image(draw_rois(img, rois), caption="Recortes ajustados", use_container_width=True)
 
             fono_line = st.slider("Línea horizontal del fonocardiograma", 0.10, 0.95, 0.55, 0.01)
-            ecg = digitize(img, rois["ecg"], "ecg")
-            dzdt = digitize(img, rois["dzdt"], "dzdt")
-            fono = digitize(img, rois["fono"], "fono")
+            ecg = digitize(img, rois["ecg"], "exxer_blue")
+            dzdt = digitize(img, rois["dzdt"], "exxer_blue")
+            fono = digitize(img, rois["fono"], "exxer_blue")
 
             st.write(f"Puntos detectados: ECG {len(ecg)} | dZ/dt {len(dzdt)} | Fono {len(fono)}")
             if dzdt.empty:
