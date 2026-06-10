@@ -29,8 +29,8 @@ APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hiperte
 DB_PATH = Path("cgi_repositorio_concordancia.sqlite3")
 FILES_DIR = Path("archivos_cgi")
 FILES_DIR.mkdir(exist_ok=True)
-ADMIN_USER = "admin"
-ADMIN_PASS_DEFAULT = "admin123"
+ADMIN_USER = "olan"
+ADMIN_PASS_DEFAULT = "ola034"
 CURSORS = ["QRS", "B", "C", "X", "Y"]
 SIGNALS = ["dzdt", "ecg", "fono"]
 
