@@ -340,30 +340,77 @@ def patient_code_from(name: str, dni: str, birthdate: str, study_date: str) -> T
 # ============================================================
 
 VARIABLES: List[Dict[str, str]] = [
-    {"codigo": "FC", "nombre": "Frecuencia Cardíaca", "unidad": "pulsos/min"},
-    {"codigo": "PAS", "nombre": "Presión sistólica", "unidad": "mmHg"},
-    {"codigo": "PAD", "nombre": "Presión diastólica", "unidad": "mmHg"},
-    {"codigo": "PAM", "nombre": "Presión media", "unidad": "mmHg"},
-    {"codigo": "DS", "nombre": "Descarga Sistólica", "unidad": "ml/pulso"},
-    {"codigo": "IDS", "nombre": "Índice de Descarga Sistólica", "unidad": "ml/pulso/m2"},
-    {"codigo": "VM", "nombre": "Volumen Minuto", "unidad": "L/min"},
-    {"codigo": "IC", "nombre": "Índice Cardíaco", "unidad": "L/min/m2"},
-    {"codigo": "RVS", "nombre": "Resistencia Vascular Sistémica", "unidad": "dyn.s.cm-5"},
-    {"codigo": "IRV", "nombre": "Índice de Resistencia Vascular", "unidad": "dyn.s.cm-5.m2"},
-    {"codigo": "CA", "nombre": "Complacencia Arterial", "unidad": "ml/mmHg"},
-    {"codigo": "IV", "nombre": "Índice de Velocidad", "unidad": "/1000/seg"},
-    {"codigo": "IAC", "nombre": "Índice de Aceleración Cardíaca", "unidad": "/100/seg2"},
-    {"codigo": "CTS", "nombre": "Cociente de Tiempo Sistólico", "unidad": "%"},
-    {"codigo": "PE", "nombre": "Período expulsivo", "unidad": "ms"},
-    {"codigo": "PPE", "nombre": "Preperíodo expulsivo", "unidad": "ms"},
-    {"codigo": "ITC", "nombre": "Índice de Trabajo Cardíaco", "unidad": "kg.m/m2"},
-    {"codigo": "CFT", "nombre": "Contenido de Fluidos Torácicos", "unidad": "kohms(-1)"},
-    {"codigo": "RR", "nombre": "Intervalo RR", "unidad": "ms"},
-    {"codigo": "DZDT_MAX", "nombre": "dZ/dt máximo", "unidad": "ohm/seg"},
-    {"codigo": "Z0", "nombre": "Impedancia basal Z0", "unidad": "ohm"},
-    {"codigo": "DIST_D", "nombre": "Distancia electrodos D", "unidad": "cm"},
-    {"codigo": "DIST_T", "nombre": "Distancia electrodos T", "unidad": "cm"},
+    # Identificación fisiológica general
+    {"codigo": "FC", "nombre": "Frecuencia cardíaca", "unidad": "pulsos/min", "categoria": "General / ritmo"},
+    {"codigo": "RR", "nombre": "Intervalo RR", "unidad": "ms", "categoria": "General / ritmo"},
+    {"codigo": "PAS", "nombre": "Presión arterial sistólica", "unidad": "mmHg", "categoria": "Presión arterial"},
+    {"codigo": "PAD", "nombre": "Presión arterial diastólica", "unidad": "mmHg", "categoria": "Presión arterial"},
+    {"codigo": "PAM", "nombre": "Presión arterial media", "unidad": "mmHg", "categoria": "Presión arterial"},
+    {"codigo": "PP", "nombre": "Presión de pulso", "unidad": "mmHg", "categoria": "Presión arterial"},
+
+    # Dinámica de fluidos / flujo
+    {"codigo": "DS", "nombre": "Descarga sistólica / volumen sistólico", "unidad": "ml/pulso", "categoria": "Dinámica de fluidos"},
+    {"codigo": "IDS", "nombre": "Índice de descarga sistólica", "unidad": "ml/pulso/m2", "categoria": "Dinámica de fluidos"},
+    {"codigo": "VM", "nombre": "Volumen minuto / gasto cardíaco", "unidad": "L/min", "categoria": "Dinámica de fluidos"},
+    {"codigo": "IC", "nombre": "Índice cardíaco", "unidad": "L/min/m2", "categoria": "Dinámica de fluidos"},
+    {"codigo": "ITC", "nombre": "Índice de trabajo cardíaco", "unidad": "kg.m/m2", "categoria": "Dinámica de fluidos"},
+    {"codigo": "ITS", "nombre": "Índice de trabajo sistólico", "unidad": "g.m/m2/lat", "categoria": "Dinámica de fluidos"},
+    {"codigo": "LCW", "nombre": "Trabajo cardíaco izquierdo", "unidad": "kg.m", "categoria": "Dinámica de fluidos"},
+    {"codigo": "LCWI", "nombre": "Índice de trabajo cardíaco izquierdo", "unidad": "kg.m/m2", "categoria": "Dinámica de fluidos"},
+    {"codigo": "LVSW", "nombre": "Trabajo sistólico ventricular izquierdo", "unidad": "g.m", "categoria": "Dinámica de fluidos"},
+    {"codigo": "LVSWI", "nombre": "Índice de trabajo sistólico ventricular izquierdo", "unidad": "g.m/m2", "categoria": "Dinámica de fluidos"},
+
+    # Postcarga / vascular
+    {"codigo": "RVS", "nombre": "Resistencia vascular sistémica", "unidad": "dyn.s.cm-5", "categoria": "Postcarga / vascular"},
+    {"codigo": "IRV", "nombre": "Índice de resistencia vascular", "unidad": "dyn.s.cm-5.m2", "categoria": "Postcarga / vascular"},
+    {"codigo": "CA", "nombre": "Complacencia arterial", "unidad": "ml/mmHg", "categoria": "Postcarga / vascular"},
+    {"codigo": "EA", "nombre": "Elastancia arterial efectiva", "unidad": "mmHg/ml", "categoria": "Postcarga / vascular"},
+    {"codigo": "EAI", "nombre": "Elastancia arterial efectiva indexada", "unidad": "mmHg/ml/m2", "categoria": "Postcarga / vascular"},
+    {"codigo": "TFC", "nombre": "Contenido de fluidos torácicos", "unidad": "kohms(-1)", "categoria": "Volemia / fluidos"},
+    {"codigo": "CFT", "nombre": "Contenido de fluidos torácicos", "unidad": "kohms(-1)", "categoria": "Volemia / fluidos"},
+    {"codigo": "TFCNR", "nombre": "Contenido de fluidos torácicos normalizado", "unidad": "adimensional", "categoria": "Volemia / fluidos"},
+    {"codigo": "CFTNR", "nombre": "Contenido de fluidos torácicos normalizado", "unidad": "adimensional", "categoria": "Volemia / fluidos"},
+
+    # Contractilidad / función sistólica
+    {"codigo": "IV", "nombre": "Índice de velocidad", "unidad": "/1000/seg", "categoria": "Contractilidad"},
+    {"codigo": "IAC", "nombre": "Índice de aceleración cardíaca", "unidad": "/100/seg2", "categoria": "Contractilidad"},
+    {"codigo": "ACI", "nombre": "Índice de aceleración cardíaca", "unidad": "/100/seg2", "categoria": "Contractilidad"},
+    {"codigo": "IH", "nombre": "Índice Heather", "unidad": "ohm/s2", "categoria": "Contractilidad"},
+    {"codigo": "HI", "nombre": "Heather index", "unidad": "ohm/s2", "categoria": "Contractilidad"},
+    {"codigo": "EES", "nombre": "Elastancia ventricular de fin de sístole", "unidad": "mmHg/ml", "categoria": "Contractilidad"},
+    {"codigo": "EESI", "nombre": "Elastancia ventricular indexada", "unidad": "mmHg/ml/m2", "categoria": "Contractilidad"},
+    {"codigo": "FE_CAPAN", "nombre": "Fracción de eyección estimada por Capan", "unidad": "%", "categoria": "Función cardíaca"},
+    {"codigo": "FE", "nombre": "Fracción de eyección", "unidad": "%", "categoria": "Función cardíaca"},
+
+    # Tiempos sistólicos y morfología CGI
+    {"codigo": "CTS", "nombre": "Cociente de tiempo sistólico", "unidad": "%", "categoria": "Tiempos sistólicos"},
+    {"codigo": "CTE", "nombre": "Cociente de tiempo eyectivo", "unidad": "%", "categoria": "Tiempos sistólicos"},
+    {"codigo": "PE", "nombre": "Período expulsivo", "unidad": "ms", "categoria": "Tiempos sistólicos"},
+    {"codigo": "PPE", "nombre": "Preperíodo expulsivo", "unidad": "ms", "categoria": "Tiempos sistólicos"},
+    {"codigo": "LVET", "nombre": "Tiempo de eyección ventricular izquierda", "unidad": "ms", "categoria": "Tiempos sistólicos"},
+    {"codigo": "PEP", "nombre": "Pre-ejection period", "unidad": "ms", "categoria": "Tiempos sistólicos"},
+
+    # Señal de impedancia y equipo
+    {"codigo": "DZDT_MAX", "nombre": "dZ/dt máximo", "unidad": "ohm/seg", "categoria": "Señal de impedancia"},
+    {"codigo": "DZDT_MIN", "nombre": "dZ/dt mínimo", "unidad": "ohm/seg", "categoria": "Señal de impedancia"},
+    {"codigo": "D2ZDT2_MAX", "nombre": "d2Z/dt2 máximo", "unidad": "ohm/seg2", "categoria": "Señal de impedancia"},
+    {"codigo": "Z0", "nombre": "Impedancia basal Z0", "unidad": "ohm", "categoria": "Señal de impedancia"},
+    {"codigo": "DIST_D", "nombre": "Distancia electrodos D", "unidad": "cm", "categoria": "Equipo / técnica"},
+    {"codigo": "DIST_T", "nombre": "Distancia electrodos T", "unidad": "cm", "categoria": "Equipo / técnica"},
+
+    # Acoplamiento ventriculoarterial y métricas derivadas
+    {"codigo": "AC", "nombre": "Acoplamiento ventriculoarterial Ea/Ees", "unidad": "relación", "categoria": "Acoplamiento"},
+    {"codigo": "EA_EES", "nombre": "Relación Ea/Ees", "unidad": "relación", "categoria": "Acoplamiento"},
+
+    # Antropometría útil para indexación / auditoría
+    {"codigo": "PESO", "nombre": "Peso", "unidad": "kg", "categoria": "Antropometría"},
+    {"codigo": "TALLA", "nombre": "Talla", "unidad": "cm", "categoria": "Antropometría"},
+    {"codigo": "IMC", "nombre": "Índice de masa corporal", "unidad": "kg/m2", "categoria": "Antropometría"},
+    {"codigo": "BSA", "nombre": "Superficie corporal", "unidad": "m2", "categoria": "Antropometría"},
 ]
+
+VARIABLE_ORDER = [v["codigo"] for v in VARIABLES]
+VARIABLE_DICT = {v["codigo"]: v for v in VARIABLES}
 
 
 def empty_variables_df() -> pd.DataFrame:
@@ -395,18 +442,76 @@ def set_df_value(df: pd.DataFrame, code: str, val, state: str = "extraído/revis
         df.loc[idx[0], "estado"] = state
 
 
+def get_df_value(df: pd.DataFrame, code: str):
+    idx = df.index[df["codigo"] == code]
+    if len(idx) == 0:
+        return np.nan
+    return pd.to_numeric(pd.Series([df.loc[idx[0], "valor"]]), errors="coerce").iloc[0]
+
+
+def copy_if_missing(df: pd.DataFrame, src: str, dst: str, state: str = "copiado/sinónimo/revisar") -> None:
+    if pd.isna(get_df_value(df, dst)) and not pd.isna(get_df_value(df, src)):
+        set_df_value(df, dst, get_df_value(df, src), state)
+
+
+def complete_derived_variables(df: pd.DataFrame) -> None:
+    """Completa variables equivalentes/derivadas para que el Excel siempre tenga columnas hemodinámicas completas."""
+    pas, pad = get_df_value(df, "PAS"), get_df_value(df, "PAD")
+    if pd.isna(get_df_value(df, "PP")) and not pd.isna(pas) and not pd.isna(pad):
+        set_df_value(df, "PP", pas - pad, "derivado PAS-PAD/revisar")
+    if pd.isna(get_df_value(df, "PAM")) and not pd.isna(pas) and not pd.isna(pad):
+        set_df_value(df, "PAM", pad + (pas - pad) / 3.0, "derivado PA/revisar")
+
+    # Sinónimos frecuentes entre informes y literatura
+    copy_if_missing(df, "CFT", "TFC")
+    copy_if_missing(df, "TFC", "CFT")
+    copy_if_missing(df, "CFTNR", "TFCNR")
+    copy_if_missing(df, "TFCNR", "CFTNR")
+    copy_if_missing(df, "IAC", "ACI")
+    copy_if_missing(df, "ACI", "IAC")
+    copy_if_missing(df, "IH", "HI")
+    copy_if_missing(df, "HI", "IH")
+    copy_if_missing(df, "PE", "LVET")
+    copy_if_missing(df, "LVET", "PE")
+    copy_if_missing(df, "PPE", "PEP")
+    copy_if_missing(df, "PEP", "PPE")
+    copy_if_missing(df, "AC", "EA_EES")
+    copy_if_missing(df, "EA_EES", "AC")
+    copy_if_missing(df, "FE_CAPAN", "FE")
+
+    # Cociente de tiempo sistólico: PPE/PE x 100
+    ppe, pe = get_df_value(df, "PPE"), get_df_value(df, "PE")
+    if pd.isna(get_df_value(df, "CTS")) and not pd.isna(ppe) and not pd.isna(pe) and pe != 0:
+        set_df_value(df, "CTS", (ppe / pe) * 100.0, "derivado PPE/PE/revisar")
+
+    # Acoplamiento si se cargaron Ea y Ees
+    ea, ees = get_df_value(df, "EA"), get_df_value(df, "EES")
+    if pd.isna(get_df_value(df, "AC")) and not pd.isna(ea) and not pd.isna(ees) and ees != 0:
+        val = ea / ees
+        set_df_value(df, "AC", val, "derivado Ea/Ees/revisar")
+        set_df_value(df, "EA_EES", val, "derivado Ea/Ees/revisar")
+
+
 
 def variable_plausible(code: str, value: float) -> bool:
     if pd.isna(value):
         return False
     ranges = {
-        "FC": (30, 180), "PAS": (50, 260), "PAD": (25, 160), "PAM": (35, 190),
+        "FC": (30, 180), "RR": (250, 2500),
+        "PAS": (50, 260), "PAD": (25, 160), "PAM": (35, 190), "PP": (10, 160),
         "DS": (5, 200), "IDS": (1, 150), "VM": (0.3, 25), "IC": (0.2, 12),
-        "RVS": (100, 8000), "IRV": (100, 12000), "CA": (0.05, 10),
-        "IV": (1, 300), "IAC": (1, 600), "CTS": (1, 100),
-        "PE": (50, 600), "PPE": (20, 300), "ITC": (0.1, 20), "CFT": (1, 100),
-        "RR": (250, 2500), "DZDT_MAX": (0.05, 20), "Z0": (5, 80),
+        "ITC": (0.1, 20), "ITS": (0.1, 200), "LCW": (0.1, 30), "LCWI": (0.1, 20),
+        "LVSW": (1, 300), "LVSWI": (1, 200),
+        "RVS": (100, 8000), "IRV": (100, 12000), "CA": (0.03, 20),
+        "EA": (0.05, 10), "EAI": (0.05, 10), "EES": (0.05, 20), "EESI": (0.05, 20),
+        "AC": (0.05, 5), "EA_EES": (0.05, 5),
+        "IV": (1, 300), "IAC": (1, 600), "ACI": (1, 600), "IH": (0.1, 200), "HI": (0.1, 200),
+        "FE_CAPAN": (5, 95), "FE": (5, 95),
+        "CTS": (1, 100), "CTE": (1, 100), "PE": (50, 600), "PPE": (20, 300), "LVET": (50, 600), "PEP": (20, 300),
+        "TFC": (1, 100), "CFT": (1, 100), "TFCNR": (0.05, 5), "CFTNR": (0.05, 5),
+        "DZDT_MAX": (0.05, 20), "DZDT_MIN": (-20, -0.01), "D2ZDT2_MAX": (0.05, 200), "Z0": (5, 80),
         "DIST_D": (5, 80), "DIST_T": (5, 80),
+        "PESO": (20, 250), "TALLA": (80, 230), "IMC": (10, 80), "BSA": (0.5, 3.5),
     }
     lo, hi = ranges.get(code, (-1e9, 1e9))
     return lo <= float(value) <= hi
@@ -471,7 +576,7 @@ def parse_words_by_position(words: List[Dict[str, float]], df: pd.DataFrame, met
     if not words:
         return
     rows = group_words_rows(words)
-    code_list = ["FC", "DS", "IDS", "VM", "IC", "RVS", "IRV", "CA", "IV", "IAC", "CTS", "ITC", "CFT"]
+    code_list = [c for c in VARIABLE_ORDER if c not in ["PAS", "PAD", "PAM", "PP", "PE", "PPE", "RR", "DZDT_MAX", "Z0", "DIST_D", "DIST_T"]]
     for row in rows:
         txt = row_text(row)
         # Presión arterial compuesta.
@@ -539,17 +644,33 @@ def parse_variable_lines(lines: List[str], df: pd.DataFrame) -> None:
     """
     aliases = {
         "FC": ["FC", "Frecuencia Card"],
-        "DS": ["DS", "Descarga Sist"],
-        "IDS": ["IDS", "Indice de Descarga", "Índice de Descarga"],
-        "VM": ["VM", "Volumen Minuto"],
-        "IC": ["IC", "Indice Card", "Índice Card"],
-        "RVS": ["RVS", "Resistencia Vascular Sist"],
-        "IRV": ["IRV", "Indice de Resistencia", "Índice de Resistencia"],
-        "CA": ["CA", "Complacencia Arterial"],
-        "IV": ["IV", "Indice de Velocidad", "Índice de Velocidad"],
-        "IAC": ["IAC", "Indice de Aceler", "Índice de Aceler"],
-        "ITC": ["ITC", "Indice de Trabajo", "Índice de Trabajo"],
-        "CFT": ["CFT", "Contenido de Fluidos"],
+        "DS": ["DS", "Descarga Sist", "Volumen Sist"],
+        "IDS": ["IDS", "Indice de Descarga", "Índice de Descarga", "Stroke Index"],
+        "VM": ["VM", "Volumen Minuto", "Gasto Cardi", "Cardiac Output"],
+        "IC": ["IC", "Indice Card", "Índice Card", "Cardiac Index"],
+        "RVS": ["RVS", "Resistencia Vascular Sist", "SVR"],
+        "IRV": ["IRV", "Indice de Resistencia", "Índice de Resistencia", "SVRI"],
+        "CA": ["CA", "Complacencia Arterial", "Arterial Compliance"],
+        "EA": ["Ea", "Elastancia Arterial", "Elastancia arterial efectiva"],
+        "EES": ["Ees", "Elastancia Ventricular", "fin de sístole", "End Systolic Elastance"],
+        "AC": ["Ea/Ees", "Acoplamiento", "Ventriculoarterial"],
+        "IV": ["IV", "Indice de Velocidad", "Índice de Velocidad", "Velocity Index"],
+        "IAC": ["IAC", "ACI", "Indice de Aceler", "Índice de Aceler", "Acceleration Index"],
+        "IH": ["IH", "HI", "Heather"],
+        "FE_CAPAN": ["FE Capan", "Fracción de Eyección Capan", "Fraccion de Eyeccion Capan"],
+        "FE": ["FE", "Fracción de Eyección", "Fraccion de Eyeccion", "Ejection Fraction"],
+        "CTS": ["CTS", "Cociente de Tiempo Sist"],
+        "CTE": ["CTE", "Cociente de Tiempo Eyect"],
+        "ITC": ["ITC", "Indice de Trabajo", "Índice de Trabajo", "Cardiac Work Index"],
+        "ITS": ["ITS", "Indice de Trabajo Sist", "Índice de Trabajo Sist", "Stroke Work Index"],
+        "CFT": ["CFT", "TFC", "Contenido de Fluidos", "Thoracic Fluid"],
+        "TFCNR": ["TFCNR", "CFTNR", "normalizado"],
+        "Z0": ["Z0", "Impedancia basal"],
+        "DZDT_MAX": ["dz/dt", "dZ/dt", "dZdt"],
+        "PESO": ["Peso"],
+        "TALLA": ["Talla", "Altura"],
+        "IMC": ["IMC", "BMI"],
+        "BSA": ["BSA", "Superficie corporal"],
     }
     used_line_idx = set()
     for i, raw in enumerate(lines):
@@ -668,6 +789,9 @@ def parse_report_text(text: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
         if len(obs) > 500 or re.search(r"PAR[ÁA]METRO|VALOR|Frecuencia Card", obs, re.I):
             obs = ""
         meta["observations"] = obs[:500]
+
+    # Completar variables equivalentes y derivadas para que el Excel tenga todas las columnas hemodinámicas.
+    complete_derived_variables(df)
 
     # Si se cargaron valores, marcar como validado visualmente pendiente de revisión.
     # El operador puede editar antes de guardar.
@@ -948,37 +1072,99 @@ def cursor_df(scope_user: dict | None = None) -> pd.DataFrame:
     return df
 
 
+def normalize_variables_for_export(vars_df: pd.DataFrame) -> pd.DataFrame:
+    """Garantiza que cada estudio exporte TODAS las variables definidas, aunque algunas no hayan sido detectadas."""
+    base = pd.DataFrame([{**v, "valor": np.nan, "estado": "no detectado/manual"} for v in VARIABLES])
+    if vars_df is None or vars_df.empty:
+        return base
+    tmp = vars_df.copy()
+    if "codigo" not in tmp.columns:
+        return base
+    for col in ["nombre", "unidad", "categoria", "valor", "estado"]:
+        if col not in tmp.columns:
+            tmp[col] = np.nan if col == "valor" else ""
+    for _, r in tmp.iterrows():
+        code = str(r.get("codigo", "")).strip()
+        if code not in VARIABLE_DICT:
+            # conservar variables no previstas en una fila adicional
+            extra = {
+                "codigo": code,
+                "nombre": r.get("nombre", code),
+                "unidad": r.get("unidad", ""),
+                "categoria": r.get("categoria", "No clasificada"),
+                "valor": pd.to_numeric(pd.Series([r.get("valor", np.nan)]), errors="coerce").iloc[0],
+                "estado": r.get("estado", "importado") or "importado",
+            }
+            base = pd.concat([base, pd.DataFrame([extra])], ignore_index=True)
+            continue
+        idx = base.index[base["codigo"] == code]
+        if len(idx):
+            i = idx[0]
+            val = pd.to_numeric(pd.Series([r.get("valor", np.nan)]), errors="coerce").iloc[0]
+            base.loc[i, "valor"] = val
+            base.loc[i, "estado"] = r.get("estado", "") or base.loc[i, "estado"]
+    complete_derived_variables(base)
+    return base
+
+
 def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
     user_filter = scope_user if only_current_user else None
     df = studies_df(user_filter)
     cdf = cursor_df(user_filter)
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        # Diccionario maestro: documenta qué debe tener SIEMPRE cada Excel.
+        pd.DataFrame(VARIABLES).to_excel(writer, index=False, sheet_name="diccionario_variables")
+
         if df.empty:
             pd.DataFrame().to_excel(writer, index=False, sheet_name="estudios")
-            pd.DataFrame().to_excel(writer, index=False, sheet_name="variables_largo")
-            pd.DataFrame().to_excel(writer, index=False, sheet_name="variables_ancho")
+            pd.DataFrame([{**v, "study_id": "", "created_at": "", "username": "", "patient_code": "", "condition_label": "", "valor": np.nan, "estado": ""} for v in VARIABLES]).to_excel(writer, index=False, sheet_name="variables_largo_todas")
+            pd.DataFrame(columns=["study_id", "created_at", "username", "patient_code", "study_date", "condition_label"] + VARIABLE_ORDER).to_excel(writer, index=False, sheet_name="variables_ancho_todas")
+            pd.DataFrame(columns=["study_id", "created_at", "username", "patient_code", "condition_label"] + [v["codigo"] for v in VARIABLES if v["categoria"] in ["Dinámica de fluidos", "Postcarga / vascular", "Contractilidad", "Función cardíaca", "Volemia / fluidos", "Acoplamiento", "Tiempos sistólicos"]]).to_excel(writer, index=False, sheet_name="hemodinamicas")
         else:
             base = df.drop(columns=["variables_json"], errors="ignore")
             base.to_excel(writer, index=False, sheet_name="estudios")
             long_rows = []
             wide_rows = []
+            hemo_rows = []
+            hemo_codes = [v["codigo"] for v in VARIABLES if v["categoria"] in ["Dinámica de fluidos", "Postcarga / vascular", "Contractilidad", "Función cardíaca", "Volemia / fluidos", "Acoplamiento", "Tiempos sistólicos"]]
             for _, r in df.iterrows():
-                vars_df = pd.read_json(io.StringIO(r["variables_json"])) if r.get("variables_json") else pd.DataFrame()
-                if not vars_df.empty:
-                    v2 = vars_df.copy()
-                    v2.insert(0, "study_id", r["id"])
-                    v2.insert(1, "created_at", r["created_at"])
-                    v2.insert(2, "username", r["username"])
-                    v2.insert(3, "patient_code", r["patient_code"])
-                    v2.insert(4, "condition_label", r["condition_label"])
-                    long_rows.append(v2)
-                    wide = {"study_id": r["id"], "created_at": r["created_at"], "username": r["username"], "patient_code": r["patient_code"], "study_date": r["study_date"], "condition_label": r["condition_label"]}
-                    for _, vv in vars_df.iterrows():
-                        wide[str(vv["codigo"])] = vv.get("valor", np.nan)
-                    wide_rows.append(wide)
-            pd.concat(long_rows, ignore_index=True).to_excel(writer, index=False, sheet_name="variables_largo") if long_rows else pd.DataFrame().to_excel(writer, index=False, sheet_name="variables_largo")
-            pd.DataFrame(wide_rows).to_excel(writer, index=False, sheet_name="variables_ancho")
+                try:
+                    raw_vars = pd.read_json(io.StringIO(r["variables_json"])) if r.get("variables_json") else pd.DataFrame()
+                except Exception:
+                    raw_vars = pd.DataFrame()
+                vars_df = normalize_variables_for_export(raw_vars)
+
+                v2 = vars_df.copy()
+                v2.insert(0, "study_id", r["id"])
+                v2.insert(1, "created_at", r["created_at"])
+                v2.insert(2, "username", r["username"])
+                v2.insert(3, "patient_code", r["patient_code"])
+                v2.insert(4, "condition_label", r["condition_label"])
+                long_rows.append(v2)
+
+                wide = {
+                    "study_id": r["id"],
+                    "created_at": r["created_at"],
+                    "username": r["username"],
+                    "patient_code": r["patient_code"],
+                    "study_date": r["study_date"],
+                    "condition_label": r["condition_label"],
+                }
+                value_map = dict(zip(vars_df["codigo"].astype(str), vars_df["valor"]))
+                for code in VARIABLE_ORDER:
+                    wide[code] = value_map.get(code, np.nan)
+                wide_rows.append(wide)
+
+                hemo = {k: wide.get(k, np.nan) for k in ["study_id", "created_at", "username", "patient_code", "condition_label"]}
+                for code in hemo_codes:
+                    hemo[code] = value_map.get(code, np.nan)
+                hemo_rows.append(hemo)
+
+            pd.concat(long_rows, ignore_index=True).to_excel(writer, index=False, sheet_name="variables_largo_todas")
+            pd.DataFrame(wide_rows, columns=["study_id", "created_at", "username", "patient_code", "study_date", "condition_label"] + VARIABLE_ORDER).to_excel(writer, index=False, sheet_name="variables_ancho_todas")
+            pd.DataFrame(hemo_rows).to_excel(writer, index=False, sheet_name="hemodinamicas")
+
         if cdf.empty:
             pd.DataFrame().to_excel(writer, index=False, sheet_name="cursores")
         else:
@@ -1072,6 +1258,7 @@ def app_main() -> None:
                     column_config={
                         "codigo": st.column_config.TextColumn("Variable", disabled=True),
                         "nombre": st.column_config.TextColumn("Nombre", disabled=True),
+                        "categoria": st.column_config.TextColumn("Categoría", disabled=True),
                         "unidad": st.column_config.TextColumn("Unidad", disabled=True),
                         "valor": st.column_config.NumberColumn("Valor corregido", format="%.3f"),
                         "estado": st.column_config.SelectboxColumn("Estado", options=["extraído/revisar", "manual/revisar", "validado"]),
