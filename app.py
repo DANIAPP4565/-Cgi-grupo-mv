@@ -249,19 +249,24 @@ def _contiguous_groups(rows: np.ndarray) -> list[tuple[int, int]]:
 
 
 def _robust_normalize_from_y(y_pixel: np.ndarray, y0: int, y1: int) -> np.ndarray:
-    """Convierte y de píxel a amplitud normalizada conservando mejor la forma.
+    """Convierte y de píxel a amplitud normalizada SIN truncar picos.
 
-    Usa percentiles para que bordes, texto o pequeñas marcas verticales no achaten la curva.
+    Versión corregida: no usa percentiles 3-97 ni `clip`, porque eso aplanaba
+    la parte superior de las curvas cuando el pico sistólico o el QRS eran altos.
+    Se normaliza con el mínimo y máximo reales de la curva seguida, dejando un
+    pequeño margen visual para que los picos no queden pegados al borde.
     """
-    amp = float(y1) - np.asarray(y_pixel, dtype=float)
-    lo, hi = np.nanpercentile(amp, [3, 97]) if len(amp) >= 10 else (np.nanmin(amp), np.nanmax(amp))
+    y = np.asarray(y_pixel, dtype=float)
+    if len(y) == 0 or not np.isfinite(y).any():
+        return np.asarray([], dtype=float)
+    amp = float(y1) - y
+    lo = float(np.nanmin(amp))
+    hi = float(np.nanmax(amp))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = float(np.nanmin(amp)), float(np.nanmax(amp))
-    amp = np.clip(amp, lo, hi)
-    den = hi - lo
-    if den <= 0:
-        return np.zeros_like(amp, dtype=float)
-    return (amp - lo) / den
+        return np.full_like(amp, 0.5, dtype=float)
+    yn = (amp - lo) / (hi - lo)
+    # margen visual: conserva la forma, evita que toque techo/piso del canal
+    return 0.06 + 0.88 * yn
 
 
 def digitize(img: Image.Image, roi: Dict[str, int], mode: str = "exxer_blue") -> pd.DataFrame:
@@ -279,6 +284,16 @@ def digitize(img: Image.Image, roi: Dict[str, int], mode: str = "exxer_blue") ->
 
     mask = make_mask(crop, mode)
     ch, cw = mask.shape
+
+    # Evita que la digitalización siga bordes del rectángulo, textos o líneas
+    # pegadas al techo/piso del recorte. Esto era la causa principal de curvas
+    # truncadas o mesetas artificiales en la parte superior/inferior.
+    y_margin = max(2, int(ch * 0.035))
+    x_margin = max(1, int(cw * 0.008))
+    mask[:y_margin, :] = False
+    mask[ch - y_margin:, :] = False
+    mask[:, :x_margin] = False
+    mask[:, cw - x_margin:] = False
     xs: list[float] = []
     ys: list[float] = []
     last_y: float | None = None
@@ -326,7 +341,7 @@ def digitize(img: Image.Image, roi: Dict[str, int], mode: str = "exxer_blue") ->
     df = pd.DataFrame({"x": xs, "y": ys}).groupby("x", as_index=False)["y"].median()
 
     # Suavizado leve: suficiente para quitar pixelado, sin destruir QRS/S1/S2.
-    win = max(3, int(len(df) * 0.006))
+    win = max(3, int(len(df) * 0.004))
     df["y"] = smooth(df["y"].to_numpy(float), win)
     df["yn"] = _robust_normalize_from_y(df["y"].to_numpy(float), r["y0"], r["y1"])
     return df
@@ -471,26 +486,48 @@ def cursor_table(auto: dict, manual: dict, guia: dict) -> pd.DataFrame:
 
 
 def plot_signals(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, auto: dict, manual: dict, guia: dict, xmin: float, xmax: float) -> bytes:
+    """Gráfico didáctico corregido.
+
+    Orden solicitado:
+    1) dZ/dt / curva de impedancia arriba
+    2) ECG al medio
+    3) Fonocardiograma abajo
+
+    Cada señal usa su propia amplitud normalizada con margen, sin recortar picos.
+    """
     x = np.linspace(xmin, xmax, 900)
+    dz = interp(dzdt, x)
+    ec = interp(ecg, x)
+    fo = interp(fono, x)
+
+    # offsets por canal: dZ/dt arriba, ECG medio, fono abajo
+    off_dz, off_ecg, off_fono = 2.4, 1.2, 0.0
+
     fig, ax = plt.subplots(figsize=(14, 6.5))
-    ax.plot(x, interp(ecg, x) + 2.4, linewidth=1.6, label="ECG")
-    ax.plot(x, interp(dzdt, x) + 1.2, linewidth=2.1, label="dZ/dt")
-    ax.plot(x, interp(fono, x), linewidth=1.6, label="Fonocardiograma")
-    ax.hlines(float(guia.get("fono_line", 0.55)), xmin, xmax, linestyles="--", linewidth=1.2, label="Línea horizontal fono")
-    for key, txt, yy in [("qrs_inicio", "QRS inicio auto", 3.45), ("qrs_pico", "QRS pico", 3.28), ("s1", "S1", 0.88), ("s2", "S2", 0.88)]:
+    ax.plot(x, dz + off_dz, linewidth=2.2, label="dZ/dt / impedancia")
+    ax.plot(x, ec + off_ecg, linewidth=1.7, label="ECG")
+    ax.plot(x, fo + off_fono, linewidth=1.6, label="Fonocardiograma")
+
+    # Línea horizontal del fono en su canal inferior.
+    ax.hlines(float(guia.get("fono_line", 0.55)) + off_fono, xmin, xmax, linestyles="--", linewidth=1.2, label="Línea horizontal fono")
+
+    for key, txt, yy in [("qrs_inicio", "QRS inicio auto", off_ecg + 0.96), ("qrs_pico", "QRS pico", off_ecg + 0.82), ("s1", "S1", off_fono + 0.88), ("s2", "S2", off_fono + 0.88)]:
         val = guia.get(key, np.nan)
         if np.isfinite(val):
             ax.axvline(float(val), linestyle="-.", linewidth=1.1)
             ax.text(float(val), yy, txt, rotation=90, ha="center", va="bottom", fontsize=9)
+
     for c in CURSORS:
         ax.axvline(float(auto[c]["x"]), linestyle=":", linewidth=1.2)
         ax.axvline(float(manual[c]["x"]), linestyle="--", linewidth=2.0)
-        label_y = 3.08 if c == "QRS" else 1.05
+        # QRS se etiqueta sobre el canal ECG; B/C/X/Y sobre el canal dZ/dt.
+        label_y = off_ecg + 0.88 if c == "QRS" else off_dz + 0.05
         ax.text(float(manual[c]["x"]), label_y, c, rotation=90, ha="center", va="bottom", fontsize=11, fontweight="bold")
-    ax.set_yticks([0.5, 1.7, 2.9])
-    ax.set_yticklabels(["Fono", "dZ/dt", "ECG"])
+
+    ax.set_yticks([off_fono + 0.5, off_ecg + 0.5, off_dz + 0.5])
+    ax.set_yticklabels(["Fono", "ECG", "dZ/dt"])
     ax.set_xlim(xmin, xmax)
-    ax.set_ylim(-0.15, 3.75)
+    ax.set_ylim(-0.08, 3.45)
     ax.grid(True, alpha=0.22)
     ax.legend(loc="upper right", fontsize=8)
     ax.set_title("Corrección integrada de cursores")
@@ -499,7 +536,6 @@ def plot_signals(ecg: pd.DataFrame, dzdt: pd.DataFrame, fono: pd.DataFrame, auto
     fig.savefig(bio, format="png", dpi=180, bbox_inches="tight")
     plt.close(fig)
     return bio.getvalue()
-
 
 def sessions_excel() -> bytes:
     df = load_sessions()
@@ -611,7 +647,7 @@ def main() -> None:
                 with cols[i]:
                     default = int(round(float(auto[cur]["x"])))
                     val = st.slider(f"Cursor {cur}", int(xmin), int(xmax), min(max(default, int(xmin)), int(xmax)), key=f"manual_{cur}")
-                    manual[cur] = {"x": float(val), "y": near_y(dzdt, float(val))}
+                    manual[cur] = {"x": float(val), "y": near_y(ecg if cur == "QRS" else dzdt, float(val))}
 
             chart = plot_signals(ecg, dzdt, fono, auto, manual, guia, xmin, xmax)
             st.image(chart, caption="ECG + dZ/dt + fonocardiograma con cursores", use_container_width=True)
