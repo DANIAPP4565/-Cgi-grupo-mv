@@ -1061,11 +1061,19 @@ def studies_df(scope_user: dict | None = None) -> pd.DataFrame:
 
 
 
+def drop_identifying_filename_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Retira columnas que puedan contener nombre/apellido del paciente, especialmente el nombre del archivo original."""
+    if df is None or df.empty:
+        return df
+    private_cols = [c for c in ["source_name", "patient_key_basis", "extracted_text", "image_path"] if c in df.columns]
+    return df.drop(columns=private_cols, errors="ignore")
+
+
 def study_row_wide(r: pd.Series) -> dict:
     """Devuelve una fila con metadatos + TODAS las variables como columnas.
     Esta es la hoja principal para análisis: no obliga al usuario a buscar las variables en otra pestaña.
     """
-    meta_cols = ["id", "created_at", "username", "patient_code", "study_date", "condition_label", "source_name", "page_number", "medication", "observations", "notes"]
+    meta_cols = ["id", "created_at", "username", "patient_code", "study_date", "condition_label", "page_number", "medication", "observations", "notes"]
     out = {c: r.get(c, "") for c in meta_cols if c in r.index}
     try:
         raw_vars = pd.read_json(io.StringIO(r.get("variables_json", ""))) if r.get("variables_json") else pd.DataFrame()
@@ -1087,9 +1095,9 @@ def studies_wide_df(scope_user: dict | None = None) -> pd.DataFrame:
     """Tabla principal visible y exportable: cada estudio en una fila + todas las variables CGI."""
     df = studies_df(scope_user)
     if df.empty:
-        return pd.DataFrame(columns=["id", "created_at", "username", "patient_code", "study_date", "condition_label", "source_name", "page_number", "medication", "observations", "notes"] + VARIABLE_ORDER + ["n_variables_con_valor", "n_variables_totales", "variables_con_valor"])
+        return pd.DataFrame(columns=["id", "created_at", "username", "patient_code", "study_date", "condition_label", "page_number", "medication", "observations", "notes"] + VARIABLE_ORDER + ["n_variables_con_valor", "n_variables_totales", "variables_con_valor"])
     rows = [study_row_wide(r) for _, r in df.iterrows()]
-    return pd.DataFrame(rows)
+    return drop_identifying_filename_columns(pd.DataFrame(rows))
 
 def cursor_df(scope_user: dict | None = None) -> pd.DataFrame:
     con = connect()
@@ -1156,7 +1164,7 @@ def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
         else:
             # Hoja principal: metadatos + TODAS las variables como columnas.
             # Así, al abrir el Excel, el usuario no ve solo los datos administrativos.
-            base = pd.DataFrame([study_row_wide(r) for _, r in df.iterrows()])
+            base = drop_identifying_filename_columns(pd.DataFrame([study_row_wide(r) for _, r in df.iterrows()]))
             base.to_excel(writer, index=False, sheet_name="estudios")
             long_rows = []
             wide_rows = []
@@ -1239,7 +1247,7 @@ def app_main() -> None:
             st.session_state.pop("user", None)
             st.rerun()
     with c3:
-        st.caption("Los nombres de pacientes no se exportan.")
+        st.caption("Los nombres de pacientes y el nombre del archivo original no se exportan.")
 
     tab1, tab2, tab3, tab4 = st.tabs(["1. Cargar informe completo", "2. Corrección opcional de curvas", "3. Mis Excel", "4. Administración"])
 
