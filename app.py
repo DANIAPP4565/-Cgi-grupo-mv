@@ -257,6 +257,25 @@ def spatial_text_from_page(page) -> str:
     return "\n".join(t[2] for t in line_items)
 
 
+def words_json_from_page(page) -> str:
+    """Guarda palabras con coordenadas para extracción por filas/columnas.
+    Esto es clave en informes Exxer, donde el texto plano puede salir desordenado.
+    """
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        words = []
+    out = []
+    for w in words:
+        try:
+            x0, y0, x1, y1, txt = w[:5]
+            if str(txt).strip():
+                out.append({"x0": float(x0), "y0": float(y0), "x1": float(x1), "y1": float(y1), "text": str(txt)})
+        except Exception:
+            continue
+    return json.dumps(out, ensure_ascii=False)
+
+
 def render_pdf_page(pdf_bytes: bytes, page: int, zoom: float) -> Tuple[Image.Image, int, str]:
     if fitz is None:
         raise RuntimeError("Falta PyMuPDF. Agregue PyMuPDF al requirements.txt.")
@@ -268,8 +287,13 @@ def render_pdf_page(pdf_bytes: bytes, page: int, zoom: float) -> Tuple[Image.Ima
         pix = p.get_pixmap(matrix=fitz.Matrix(float(zoom), float(zoom)), alpha=False)
         plain_text = p.get_text("text") or ""
         spatial_text = spatial_text_from_page(p)
-        # Primero líneas espaciales; después texto plano como respaldo.
-        text = ("=== LINEAS_ESPACIALES_PDF ===\n" + spatial_text + "\n=== TEXTO_PLANO_PDF ===\n" + plain_text).strip()
+        words_json = words_json_from_page(p)
+        # Primero coordenadas, luego líneas espaciales y texto plano como respaldo.
+        text = (
+            "=== WORDS_JSON_PDF ===\n" + words_json +
+            "\n=== LINEAS_ESPACIALES_PDF ===\n" + spatial_text +
+            "\n=== TEXTO_PLANO_PDF ===\n" + plain_text
+        ).strip()
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), total, text
     finally:
         doc.close()
@@ -370,6 +394,141 @@ def set_df_value(df: pd.DataFrame, code: str, val, state: str = "extraído/revis
         df.loc[idx[0], "valor"] = float(val)
         df.loc[idx[0], "estado"] = state
 
+
+
+def variable_plausible(code: str, value: float) -> bool:
+    if pd.isna(value):
+        return False
+    ranges = {
+        "FC": (30, 180), "PAS": (50, 260), "PAD": (25, 160), "PAM": (35, 190),
+        "DS": (5, 200), "IDS": (1, 150), "VM": (0.3, 25), "IC": (0.2, 12),
+        "RVS": (100, 8000), "IRV": (100, 12000), "CA": (0.05, 10),
+        "IV": (1, 300), "IAC": (1, 600), "CTS": (1, 100),
+        "PE": (50, 600), "PPE": (20, 300), "ITC": (0.1, 20), "CFT": (1, 100),
+        "RR": (250, 2500), "DZDT_MAX": (0.05, 20), "Z0": (5, 80),
+        "DIST_D": (5, 80), "DIST_T": (5, 80),
+    }
+    lo, hi = ranges.get(code, (-1e9, 1e9))
+    return lo <= float(value) <= hi
+
+
+def extract_words_json(text: str) -> List[Dict[str, float]]:
+    if "=== WORDS_JSON_PDF ===" not in text:
+        return []
+    block = text.split("=== WORDS_JSON_PDF ===", 1)[1].split("=== LINEAS_ESPACIALES_PDF ===", 1)[0].strip()
+    try:
+        data = json.loads(block)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def group_words_rows(words: List[Dict[str, float]], y_tol: float = 4.5) -> List[List[Dict[str, float]]]:
+    """Agrupa palabras en filas usando coordenada Y, preservando columnas por X."""
+    clean = []
+    for w in words:
+        try:
+            txt = str(w.get("text", "")).strip()
+            if not txt:
+                continue
+            w2 = dict(w)
+            w2["yc"] = (float(w2["y0"]) + float(w2["y1"])) / 2.0
+            clean.append(w2)
+        except Exception:
+            pass
+    clean.sort(key=lambda z: (z["yc"], float(z.get("x0", 0))))
+    rows: List[List[Dict[str, float]]] = []
+    centers: List[float] = []
+    for w in clean:
+        if not rows or abs(w["yc"] - centers[-1]) > y_tol:
+            rows.append([w]); centers.append(w["yc"])
+        else:
+            rows[-1].append(w)
+            centers[-1] = sum(x["yc"] for x in rows[-1]) / len(rows[-1])
+    for r in rows:
+        r.sort(key=lambda z: float(z.get("x0", 0)))
+    return rows
+
+
+def row_text(row: List[Dict[str, float]]) -> str:
+    return re.sub(r"\s+", " ", " ".join(str(w.get("text", "")) for w in row)).strip()
+
+
+def numeric_tokens_after(row: List[Dict[str, float]], x_start: float) -> List[Tuple[float, float]]:
+    vals = []
+    for w in row:
+        if float(w.get("x0", 0)) <= x_start:
+            continue
+        txt = str(w.get("text", ""))
+        for m in re.finditer(r"-?\d+(?:[\.,]\d+)?", txt):
+            vals.append((float(w.get("x0", 0)), to_float(m.group(0))))
+    vals.sort(key=lambda t: t[0])
+    return vals
+
+
+def parse_words_by_position(words: List[Dict[str, float]], df: pd.DataFrame, meta: Dict[str, str]) -> None:
+    """Extractor principal para PDF nativo Exxer: usa coordenadas, no texto plano.\n    Evita confundir valores reales con referencias de barras y evita cargar observaciones como medicación.\n    """
+    if not words:
+        return
+    rows = group_words_rows(words)
+    code_list = ["FC", "DS", "IDS", "VM", "IC", "RVS", "IRV", "CA", "IV", "IAC", "CTS", "ITC", "CFT"]
+    for row in rows:
+        txt = row_text(row)
+        # Presión arterial compuesta.
+        if any(str(w.get("text", "")).strip().upper() == "PA" for w in row) or re.search(r"Sist[óo]lica/Diast[óo]lica", txt, re.I):
+            m = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})\s*\(?\s*(\d{2,3})?\s*\)?", txt)
+            if m:
+                set_df_value(df, "PAS", to_float(m.group(1)), "extraído/pdf-coordenadas/revisar")
+                set_df_value(df, "PAD", to_float(m.group(2)), "extraído/pdf-coordenadas/revisar")
+                if m.group(3):
+                    set_df_value(df, "PAM", to_float(m.group(3)), "extraído/pdf-coordenadas/revisar")
+        # Variables de tabla izquierda.
+        for code in code_list:
+            code_words = [w for w in row if str(w.get("text", "")).strip().upper() == code]
+            if not code_words:
+                continue
+            x_code = min(float(w.get("x1", 0)) for w in code_words)
+            nums = numeric_tokens_after(row, x_code)
+            # Para evitar tomar referencias de barras, se elige el primer número plausible después del código.
+            for _, val in nums:
+                if variable_plausible(code, val):
+                    set_df_value(df, code, val, "extraído/pdf-coordenadas/revisar")
+                    break
+            if code == "CTS":
+                m = re.search(r"(\d+(?:[\.,]\d+)?)\s*%?\s*\(?\s*(\d+(?:[\.,]\d+)?)\s*/\s*(\d+(?:[\.,]\d+)?)", txt)
+                if m:
+                    set_df_value(df, "CTS", to_float(m.group(1)), "extraído/pdf-coordenadas/revisar")
+                    set_df_value(df, "PPE", to_float(m.group(2)), "extraído/pdf-coordenadas/revisar")
+                    set_df_value(df, "PE", to_float(m.group(3)), "extraído/pdf-coordenadas/revisar")
+        # Panel derecho: suele estar en filas RR / PE / PPE / dz/dt / Z0.
+        for code in ["RR", "PE", "PPE"]:
+            code_words = [w for w in row if str(w.get("text", "")).strip().upper() == code]
+            for cw in code_words:
+                for _, val in numeric_tokens_after(row, float(cw.get("x1", 0))):
+                    if variable_plausible(code, val):
+                        set_df_value(df, code, val, "extraído/pdf-coordenadas/revisar")
+                        break
+        if re.search(r"dZ/dt|dz/dt|dZdt|dzdt", txt, re.I):
+            nums = [to_float(x) for x in re.findall(r"-?\d+(?:[\.,]\d+)?", txt)]
+            nums = [x for x in nums if variable_plausible("DZDT_MAX", x)]
+            if nums:
+                set_df_value(df, "DZDT_MAX", nums[-1], "extraído/pdf-coordenadas/revisar")
+        if re.search(r"\bZ0\b|\bZO\b", txt, re.I):
+            nums = [to_float(x) for x in re.findall(r"-?\d+(?:[\.,]\d+)?", txt)]
+            nums = [x for x in nums if variable_plausible("Z0", x)]
+            if nums:
+                set_df_value(df, "Z0", nums[-1], "extraído/pdf-coordenadas/revisar")
+        if re.search(r"Dist\.?\s*e/?\s*electrodos|electrodos|D\s*:", txt, re.I):
+            md = re.search(r"\bD\s*[:=]\s*(\d+(?:[\.,]\d+)?)", txt, re.I)
+            mt = re.search(r"\bT\s*[:=]\s*(\d+(?:[\.,]\d+)?)", txt, re.I)
+            if md: set_df_value(df, "DIST_D", to_float(md.group(1)), "extraído/pdf-coordenadas/revisar")
+            if mt: set_df_value(df, "DIST_T", to_float(mt.group(1)), "extraído/pdf-coordenadas/revisar")
+        # Medicación: tomar sólo la fila donde aparece medicación, antes del panel gráfico o valores clínicos.
+        if re.search(r"Medicaci[oó]n", txt, re.I):
+            med = re.sub(r".*Medicaci[oó]n", "", txt, flags=re.I).strip()
+            med = re.sub(r"\b(RR|PE|PPE|dz/dt|Z0|Dist\.).*", "", med, flags=re.I).strip()
+            if med:
+                meta["medication"] = med[:180]
 
 def parse_variable_lines(lines: List[str], df: pd.DataFrame) -> None:
     """Extrae valores cuando el PDF conserva una línea por variable.
@@ -487,18 +646,28 @@ def parse_report_text(text: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     else:
         spatial_lines = raw_lines
 
+    words = extract_words_json(text)
+    parse_words_by_position(words, df, meta)
     parse_variable_lines(spatial_lines, df)
     parse_right_panel_text(text, df)
     fallback_sequence_parse(text, df)
 
     joined = "\n".join(raw_lines)
     flat = re.sub(r"\s+", " ", joined)
-    m = re.search(r"Medicaci[oó]n\s+(.+?)(?:Observaciones|Dist\.|D:\s*\d|$)", flat, re.I)
-    if m:
-        meta["medication"] = re.sub(r"\s+", " ", m.group(1)).strip()[:180]
+    if not meta.get("medication"):
+        m = re.search(r"Medicaci[oó]n\s+(.+?)(?:\bRR\b|\bPE\b|\bPPE\b|dz/dt|Z0|Dist\.|Observaciones|$)", flat, re.I)
+        if m:
+            med = re.sub(r"\s+", " ", m.group(1)).strip()
+            # Evita que la tabla de variables entre en Medicación si el PDF concatenó columnas.
+            med = re.sub(r"\b(PA|FC|DS|IDS|VM|IC|RVS|IRV|CA|IV|IAC|CTS|ITC|CFT)\b.*", "", med, flags=re.I).strip()
+            meta["medication"] = med[:180]
     m = re.search(r"Observaciones\s+(.+?)(?:www\.|$)", flat, re.I)
     if m:
-        meta["observations"] = re.sub(r"\s+", " ", m.group(1)).strip()[:500]
+        obs = re.sub(r"\s+", " ", m.group(1)).strip()
+        # Si se pegó todo el informe, mantener sólo observación breve real.
+        if len(obs) > 500 or re.search(r"PAR[ÁA]METRO|VALOR|Frecuencia Card", obs, re.I):
+            obs = ""
+        meta["observations"] = obs[:500]
 
     # Si se cargaron valores, marcar como validado visualmente pendiente de revisión.
     # El operador puede editar antes de guardar.
@@ -862,6 +1031,11 @@ def app_main() -> None:
                 img, page, source, text = open_uploaded(uploaded)
                 st.image(img, caption="Hoja completa renderizada", use_container_width=True)
                 parsed_df, meta = parse_report_text(text)
+                n_extraidos = int(parsed_df["valor"].notna().sum())
+                if n_extraidos == 0:
+                    st.error("No se pudieron extraer variables numéricas del PDF. Verifique que el PDF tenga texto seleccionable; si es una imagen escaneada, cargue los valores manualmente o use un PDF nativo.")
+                else:
+                    st.success(f"Variables numéricas detectadas automáticamente: {n_extraidos}/{len(parsed_df)}")
                 with st.expander("Texto extraído del PDF", expanded=False):
                     if text.strip():
                         st.text_area("Texto", value=text, height=220)
