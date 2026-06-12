@@ -1,7 +1,0 @@
-streamlit==1.40.2
-pandas
-numpy
-matplotlib
-Pillow
-PyMuPDF
-openpyxl
