@@ -1,0 +1,9 @@
+streamlit==1.40.2
+pandas
+numpy
+matplotlib
+Pillow
+PyMuPDF
+openpyxl
+streamlit-drawable-canvas==0.9.3
+streamlit-image-coordinates
