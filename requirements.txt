@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-matplotlib
-Pillow
-PyMuPDF
-openpyxl
-streamlit-drawable-canvas==0.9.3
