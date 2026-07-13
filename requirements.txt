@@ -1,7 +1,8 @@
-streamlit==1.40.2
-pandas
+streamlit
 numpy
-matplotlib
+pandas
 Pillow
+matplotlib
 PyMuPDF
 openpyxl
+boto3
