@@ -8,6 +8,9 @@ import re
 import secrets
 import sqlite3
 import traceback
+import shutil
+import tempfile
+from datetime import timedelta
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -19,210 +22,12 @@ from PIL import Image, ImageDraw, ImageOps
 import matplotlib.pyplot as plt
 
 # ============================================================
-# COMPATIBILIDAD STREAMLIT + streamlit-drawable-canvas
+# ESTABILIDAD DEL FRONTEND
 # ============================================================
-# streamlit-drawable-canvas 0.9.3 usa internamente image_to_url con
-# firmas antiguas de Streamlit. En Streamlit reciente esa función fue
-# movida/modificada y puede fallar con:
-# - module 'streamlit.elements.image' has no attribute 'image_to_url'
-# - AttributeError: 'int' object has no attribute 'width'
-# Este parche crea un puente compatible antes de importar st_canvas.
-
-def _install_canvas_image_to_url_patch() -> None:
-    """Parche idempotente para Streamlit + streamlit-drawable-canvas.
-
-    Corrige el RecursionError generado cuando Streamlit reejecuta la app y el
-    parche viejo queda envuelto sobre sí mismo muchas veces.
-    """
-    try:
-        import inspect
-        from types import SimpleNamespace
-        import streamlit.elements.image as _st_image
-
-        _image_utils = None
-        try:
-            from streamlit.elements.lib import image_utils as _image_utils  # Streamlit nuevo
-        except Exception:
-            _image_utils = None
-
-        def _is_compat_wrapper(fn) -> bool:
-            if fn is None:
-                return False
-            if getattr(fn, "_olano_compat_image_to_url", False):
-                return True
-            # Detecta wrappers antiguos de esta misma app que no tenían marca.
-            return getattr(fn, "__name__", "") == "_compat_image_to_url"
-
-        def _unwrap_original(fn):
-            """Desenvuelve cadenas viejas _compat -> _compat -> original."""
-            seen = set()
-            current = fn
-            while callable(current) and id(current) not in seen:
-                seen.add(id(current))
-                stored = getattr(current, "_olano_original_image_to_url", None)
-                if callable(stored) and id(stored) not in seen:
-                    current = stored
-                    continue
-
-                if not _is_compat_wrapper(current):
-                    return current
-
-                # Wrapper viejo: la función original vive en el closure con
-                # nombre "_original_image_to_url".
-                try:
-                    freevars = list(getattr(current, "__code__", None).co_freevars)
-                    closure = current.__closure__ or ()
-                    if "_original_image_to_url" in freevars:
-                        idx = freevars.index("_original_image_to_url")
-                        candidate = closure[idx].cell_contents
-                        if callable(candidate) and id(candidate) not in seen:
-                            current = candidate
-                            continue
-                except Exception:
-                    pass
-                break
-            return current if callable(current) and not _is_compat_wrapper(current) else None
-
-        # Recuperar una función original real guardada o desenvolver wrappers viejos.
-        _original_image_to_url = _unwrap_original(getattr(_st_image, "_olano_original_image_to_url", None))
-        if _original_image_to_url is None and _image_utils is not None:
-            _original_image_to_url = _unwrap_original(getattr(_image_utils, "_olano_original_image_to_url", None))
-
-        if _original_image_to_url is None:
-            candidates = []
-            if _image_utils is not None:
-                candidates.append(getattr(_image_utils, "image_to_url", None))
-            candidates.append(getattr(_st_image, "image_to_url", None))
-            for fn in candidates:
-                unwrapped = _unwrap_original(fn)
-                if callable(unwrapped):
-                    _original_image_to_url = unwrapped
-                    break
-
-        if _original_image_to_url is None:
-            return
-
-        # Guardar la original real para próximos reruns de Streamlit.
-        try:
-            _st_image._olano_original_image_to_url = _original_image_to_url
-        except Exception:
-            pass
-        if _image_utils is not None:
-            try:
-                _image_utils._olano_original_image_to_url = _original_image_to_url
-            except Exception:
-                pass
-
-        def _layout_config_from_width(width):
-            """Convierte el ancho entero antiguo en layout_config.width."""
-            if hasattr(width, "width"):
-                return width
-            try:
-                layout_width = int(width) if isinstance(width, (int, float)) else "content"
-            except Exception:
-                layout_width = "content"
-            try:
-                from streamlit.elements.lib.layout_utils import LayoutConfig
-                try:
-                    return LayoutConfig(width=layout_width)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            return SimpleNamespace(width=layout_width, height=None)
-
-        def _compat_image_to_url(
-            image,
-            width=None,
-            clamp=False,
-            channels="RGB",
-            output_format="auto",
-            image_id="drawable-canvas-bg",
-            *args,
-            **kwargs,
-        ):
-            """Acepta la firma antigua y la firma nueva de Streamlit sin recursión."""
-            layout_config = kwargs.pop("layout_config", None)
-            if layout_config is None:
-                layout_config = _layout_config_from_width(width)
-            elif isinstance(layout_config, (int, float, str)):
-                layout_config = _layout_config_from_width(layout_config)
-
-            try:
-                sig = inspect.signature(_original_image_to_url)
-                expects_layout = "layout_config" in sig.parameters
-            except Exception:
-                expects_layout = True
-
-            if expects_layout:
-                try:
-                    return _original_image_to_url(
-                        image,
-                        layout_config=layout_config,
-                        clamp=bool(clamp),
-                        channels=channels,
-                        output_format=output_format,
-                        image_id=str(image_id),
-                    )
-                except TypeError:
-                    try:
-                        return _original_image_to_url(
-                            image,
-                            layout_config,
-                            bool(clamp),
-                            channels,
-                            output_format,
-                            str(image_id),
-                        )
-                    except TypeError:
-                        raw_width = getattr(layout_config, "width", width)
-                        if raw_width == "content":
-                            raw_width = width
-                        return _original_image_to_url(
-                            image,
-                            raw_width,
-                            bool(clamp),
-                            channels,
-                            output_format,
-                            str(image_id),
-                        )
-
-            # Firma vieja: image_to_url(image, width, clamp, channels, output_format, image_id)
-            raw_width = getattr(layout_config, "width", width)
-            if raw_width == "content":
-                raw_width = width
-            return _original_image_to_url(
-                image,
-                raw_width,
-                bool(clamp),
-                channels,
-                output_format,
-                str(image_id),
-            )
-
-        # Marcar el wrapper para que un próximo rerun nunca lo tome como original.
-        _compat_image_to_url._olano_compat_image_to_url = True
-        _compat_image_to_url._olano_original_image_to_url = _original_image_to_url
-
-        # Parchear ambos lugares. Streamlit puede llamar desde elements.image y
-        # streamlit-drawable-canvas puede llamar desde image_utils según versión.
-        try:
-            _st_image.image_to_url = _compat_image_to_url
-        except Exception:
-            pass
-        if _image_utils is not None:
-            try:
-                _image_utils.image_to_url = _compat_image_to_url
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-try:
-    _install_canvas_image_to_url_patch()
-    from streamlit_drawable_canvas import st_canvas
-except Exception:
-    st_canvas = None
+# No se importa streamlit-drawable-canvas ni se modifican funciones internas
+# de Streamlit. El editor activo usa el componente HTML/JS V2 definido más
+# abajo. Esto evita desmontajes dobles del DOM (NotFoundError/removeChild).
+st_canvas = None
 
 try:
     import fitz  # PyMuPDF
@@ -232,9 +37,15 @@ except Exception:
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
-DB_PATH = Path("cgi_repositorio_concordancia.sqlite3")
-FILES_DIR = Path("archivos_cgi")
-FILES_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(get_secret_value("CGI_DATA_DIR", os.getenv("CGI_DATA_DIR", "cgi_data"))) if "get_secret_value" in globals() else Path(os.getenv("CGI_DATA_DIR", "cgi_data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "cgi_repositorio_concordancia.sqlite3"
+FILES_DIR = DATA_DIR / "archivos_cgi"
+BACKUP_DIR = DATA_DIR / "respaldos"
+FILES_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_INTERVAL_HOURS = 72
+BACKUP_STATE_FILE = BACKUP_DIR / "ultimo_respaldo.json"
 ADMIN_USER_DEFAULT = os.getenv("CGI_ADMIN_USER", "olan")
 CURSORS = ["QRS", "B", "C", "X", "Y"]
 SIGNALS = ["dzdt", "ecg", "fono"]
@@ -271,8 +82,15 @@ def css() -> None:
 # ============================================================
 
 def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=FULL")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return con
 
 
@@ -312,6 +130,176 @@ def get_secret_value(name: str, default: str = "") -> str:
         pass
     return default
 
+
+
+def _s3_configured() -> bool:
+    return bool(get_secret_value("CGI_S3_BUCKET", ""))
+
+
+def _s3_client():
+    """Cliente S3 opcional. Requiere boto3 y Secrets CGI_S3_BUCKET/AWS_*.
+    El uso de almacenamiento externo es la única forma de conservar datos
+    frente a reinicios o redeploys del disco efímero de Streamlit Cloud.
+    """
+    try:
+        import boto3
+    except Exception as exc:
+        raise RuntimeError("Para respaldo remoto instale boto3 en requirements.txt.") from exc
+    kwargs = {}
+    region = get_secret_value("AWS_DEFAULT_REGION", "")
+    endpoint = get_secret_value("CGI_S3_ENDPOINT_URL", "")
+    access = get_secret_value("AWS_ACCESS_KEY_ID", "")
+    secret = get_secret_value("AWS_SECRET_ACCESS_KEY", "")
+    if region:
+        kwargs["region_name"] = region
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    if access and secret:
+        kwargs["aws_access_key_id"] = access
+        kwargs["aws_secret_access_key"] = secret
+    return boto3.client("s3", **kwargs)
+
+
+def migrate_legacy_local_database() -> tuple[bool, str]:
+    """Migra la base de versiones anteriores sin borrar usuarios ni estudios."""
+    legacy_candidates = [
+        Path("cgi_repositorio_concordancia.sqlite3"),
+        Path("./cgi_repositorio_concordancia.sqlite3"),
+    ]
+    if DB_PATH.exists():
+        return False, ""
+    for legacy in legacy_candidates:
+        try:
+            if legacy.resolve() == DB_PATH.resolve():
+                continue
+            if legacy.exists() and legacy.stat().st_size > 0:
+                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, DB_PATH)
+                return True, f"Base anterior migrada desde {legacy}."
+        except Exception:
+            continue
+    return False, ""
+
+
+def allow_empty_remote_initialization() -> bool:
+    return get_secret_value("CGI_ALLOW_EMPTY_INIT", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
+
+
+def restore_database_from_remote_if_missing() -> tuple[bool, str]:
+    """Restaura automáticamente la base más reciente si el archivo local no existe."""
+    if DB_PATH.exists() or not _s3_configured():
+        return False, ""
+    bucket = get_secret_value("CGI_S3_BUCKET", "")
+    key = get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3")
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DB_PATH.with_suffix(".restore.tmp")
+        _s3_client().download_file(bucket, key, str(tmp))
+        if tmp.exists() and tmp.stat().st_size > 0:
+            tmp.replace(DB_PATH)
+            return True, "Base de usuarios y estudios restaurada desde almacenamiento remoto."
+    except Exception as exc:
+        return False, f"No se pudo restaurar la base remota: {exc}"
+    return False, "No se encontró una copia remota válida."
+
+
+def database_integrity_summary(path: Path | None = None) -> dict:
+    """Valida integridad y contabiliza usuarios/estudios sin exponer hashes."""
+    path = path or DB_PATH
+    result = {"ok": False, "users": 0, "studies": 0, "admins": 0, "error": ""}
+    if not path.exists() or path.stat().st_size <= 0:
+        result["error"] = "La base no existe o está vacía."
+        return result
+    con = None
+    try:
+        con = sqlite3.connect(path, timeout=30)
+        integrity = con.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            result["error"] = f"SQLite integrity_check: {integrity[0] if integrity else 'sin respuesta'}"
+            return result
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "users" in tables:
+            result["users"] = int(con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            result["admins"] = int(con.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0])
+        if "studies" in tables:
+            result["studies"] = int(con.execute("SELECT COUNT(*) FROM studies").fetchone()[0])
+        result["ok"] = True
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+    finally:
+        if con is not None:
+            con.close()
+
+
+def create_sqlite_snapshot(target: Path) -> Path:
+    """Copia consistente de SQLite usando la API backup; conserva hashes y roles."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    src = connect()
+    dst = sqlite3.connect(tmp)
+    try:
+        src.backup(dst)
+        dst.commit()
+    finally:
+        dst.close()
+        src.close()
+    check = database_integrity_summary(tmp)
+    if not check.get("ok"):
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        raise RuntimeError(f"La copia SQLite no superó la validación: {check.get('error','error desconocido')}")
+    tmp.replace(target)
+    return target
+
+
+def _upload_backup_to_s3(local_path: Path, remote_key: str) -> None:
+    if not _s3_configured():
+        return
+    bucket = get_secret_value("CGI_S3_BUCKET", "")
+    extra = {"ServerSideEncryption": "AES256"}
+    _s3_client().upload_file(str(local_path), bucket, remote_key, ExtraArgs=extra)
+
+
+def read_backup_state() -> dict:
+    try:
+        return json.loads(BACKUP_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_backup_state(data: dict) -> None:
+    tmp = BACKUP_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(BACKUP_STATE_FILE)
+
+
+def backup_due(hours: int = BACKUP_INTERVAL_HOURS) -> bool:
+    state = read_backup_state()
+    raw = state.get("created_at", "")
+    try:
+        last = datetime.fromisoformat(raw)
+        return datetime.now() - last >= timedelta(hours=int(hours))
+    except Exception:
+        return True
+
+
+def preserve_database_after_write(reason: str = "actualizacion") -> None:
+    """Mantiene una copia local rotativa después de cada cambio de credenciales o datos."""
+    try:
+        latest = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+        create_sqlite_snapshot(latest)
+        # Se actualiza también la copia remota estable si está configurada.
+        if _s3_configured():
+            _upload_backup_to_s3(latest, get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3"))
+    except Exception:
+        # Nunca interrumpe el guardado clínico por un fallo secundario de respaldo.
+        pass
 
 def init_db() -> None:
     con = connect()
@@ -387,6 +375,8 @@ def init_db() -> None:
         )
         con.commit()
     con.close()
+    # Crea/actualiza inmediatamente una copia consistente después de inicializar.
+    preserve_database_after_write("inicializacion_base")
 
 
 def get_user(username: str):
@@ -408,6 +398,7 @@ def create_user(username: str, password: str, full_name: str, matricula: str, pr
         )
         con.commit()
         con.close()
+        preserve_database_after_write("alta_usuario")
         return True, "Usuario registrado. Ya puede ingresar."
     except sqlite3.IntegrityError:
         return False, "Ese usuario ya existe."
@@ -452,6 +443,7 @@ def create_admin_user(username: str, password: str, full_name: str = "Administra
         )
         con.commit()
         con.close()
+        preserve_database_after_write("alta_administrador")
         return True, "Administrador creado. La clave solo se mostró una vez."
     except sqlite3.IntegrityError:
         con = connect()
@@ -465,6 +457,7 @@ def create_admin_user(username: str, password: str, full_name: str = "Administra
         )
         con.commit()
         con.close()
+        preserve_database_after_write("conversion_administrador")
         return True, "Usuario existente convertido en administrador. La clave solo se mostró una vez."
 
 
@@ -480,6 +473,7 @@ def set_user_password(username: str, password: str) -> Tuple[bool, str]:
     con.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), int(row["id"])))
     con.commit()
     con.close()
+    preserve_database_after_write("cambio_clave")
     return True, "Clave actualizada. No queda visible para otros usuarios."
 
 
@@ -494,6 +488,7 @@ def set_user_role(username: str, role: str, active: int = 1) -> Tuple[bool, str]
     con.execute("UPDATE users SET role=?, active=? WHERE id=?", (role, int(active), int(row["id"])))
     con.commit()
     con.close()
+    preserve_database_after_write("cambio_rol")
     return True, f"Usuario actualizado como {role}."
 
 
@@ -2778,6 +2773,7 @@ def save_study(user: dict, patient_code: str, key_basis: str, study_date: str, c
     con.commit()
     sid = int(cur.lastrowid)
     con.close()
+    preserve_database_after_write("nuevo_estudio")
     return sid
 
 
@@ -2793,6 +2789,7 @@ def save_cursor_correction(user: dict, study_id, patient_code: str, source: str,
     con.commit()
     cid = int(cur.lastrowid)
     con.close()
+    preserve_database_after_write("correccion_cursores")
     return cid
 
 
@@ -2968,13 +2965,140 @@ def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
+
+def generate_automatic_backup(force: bool = False) -> dict:
+    """Genera cada 72 h un Excel global y una copia completa de SQLite.
+
+    El Excel no incluye contraseñas. La copia SQLite sí conserva usuarios,
+    roles y hashes PBKDF2 necesarios para restaurar el acceso.
+    """
+    if not force and not backup_due():
+        return read_backup_state()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    db_file = BACKUP_DIR / f"cgi_base_completa_{stamp}.sqlite3"
+    xlsx_file = BACKUP_DIR / f"cgi_todos_los_estudios_{stamp}.xlsx"
+    create_sqlite_snapshot(db_file)
+    xlsx_file.write_bytes(export_excel({}, only_current_user=False))
+
+    # Alias estables para descarga y restauración.
+    latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+    latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    shutil.copy2(db_file, latest_db)
+    shutil.copy2(xlsx_file, latest_xlsx)
+
+    remote_ok = False
+    remote_error = ""
+    if _s3_configured():
+        try:
+            prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
+            _upload_backup_to_s3(db_file, f"{prefix}/historico/{db_file.name}")
+            _upload_backup_to_s3(xlsx_file, f"{prefix}/historico/{xlsx_file.name}")
+            _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
+            _upload_backup_to_s3(latest_xlsx, f"{prefix}/latest/cgi_todos_los_estudios.xlsx")
+            remote_ok = True
+        except Exception as exc:
+            remote_error = str(exc)
+
+    state = {
+        "created_at": now_iso(),
+        "next_due_at": (datetime.now() + timedelta(hours=BACKUP_INTERVAL_HOURS)).isoformat(timespec="seconds"),
+        "database_file": str(latest_db),
+        "excel_file": str(latest_xlsx),
+        "remote_configured": _s3_configured(),
+        "remote_ok": remote_ok,
+        "remote_error": remote_error,
+    }
+    write_backup_state(state)
+
+    # Rotación local: conserva los 10 respaldos más recientes de cada tipo.
+    for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx"):
+        old = sorted(BACKUP_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)[10:]
+        for f in old:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    return state
+
+
+def backup_admin_panel() -> None:
+    st.markdown("#### Respaldo automático cada 72 horas")
+    integrity = database_integrity_summary()
+    if integrity.get("ok"):
+        st.success(f"Base íntegra: {integrity.get('users',0)} usuarios, {integrity.get('admins',0)} administrador/es y {integrity.get('studies',0)} estudios.")
+    else:
+        st.error(f"Control de integridad fallido: {integrity.get('error','sin detalle')}")
+    state = read_backup_state()
+    if state:
+        st.info(f"Último respaldo: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
+    else:
+        st.warning("Todavía no se generó el primer respaldo automático.")
+    if _s3_configured():
+        if state.get("remote_ok"):
+            st.success("Respaldo remoto cifrado en S3 activo.")
+        else:
+            st.warning(f"S3 configurado, pero el último envío no se confirmó: {state.get('remote_error','sin detalle')}")
+    else:
+        st.warning("El respaldo local no sobrevive necesariamente a un redeploy de Streamlit Cloud. Configure CGI_S3_BUCKET y credenciales AWS/S3 para persistencia real.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Generar respaldo ahora", key="force_backup_now"):
+            try:
+                state = generate_automatic_backup(force=True)
+                st.success(f"Respaldo creado: {state.get('created_at','')}")
+            except Exception as exc:
+                st.error(f"No se pudo generar el respaldo: {exc}")
+    latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+    with c2:
+        if latest_xlsx.exists():
+            st.download_button(
+                "Descargar último Excel automático",
+                data=latest_xlsx.read_bytes(),
+                file_name="cgi_todos_los_estudios_ultimo.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_latest_auto_excel",
+            )
+    if latest_db.exists():
+        st.download_button(
+            "Descargar copia completa de seguridad (usuarios + estudios)",
+            data=latest_db.read_bytes(),
+            file_name="cgi_repositorio_respaldo.sqlite3",
+            mime="application/octet-stream",
+            key="download_latest_db_backup",
+        )
+        st.caption("Esta copia contiene hashes de contraseña, no contraseñas legibles. Debe guardarse en un lugar seguro y solo estar disponible para el administrador.")
+
 # ============================================================
 # INTERFAZ
 # ============================================================
 
 def app_main() -> None:
     css()
+    migrated, migration_msg = migrate_legacy_local_database()
+    restored = False
+    restore_msg = ""
+    if not DB_PATH.exists():
+        restored, restore_msg = restore_database_from_remote_if_missing()
+        if _s3_configured() and not restored and not allow_empty_remote_initialization():
+            st.error("Protección de datos activada: no se creó una base vacía porque falló la restauración remota.")
+            st.code(restore_msg or "No se pudo recuperar la base remota.")
+            st.info("Revise CGI_S3_BUCKET, CGI_S3_DB_KEY y las credenciales. Para una instalación completamente nueva, defina CGI_ALLOW_EMPTY_INIT=true una sola vez.")
+            st.stop()
     init_db()
+    integrity = database_integrity_summary()
+    if not integrity.get("ok"):
+        st.error(f"La base no superó el control de integridad: {integrity.get('error','sin detalle')}")
+        st.stop()
+    try:
+        generate_automatic_backup(force=False)
+    except Exception:
+        pass
+    if migrated and migration_msg:
+        st.success(migration_msg)
+    if restored and restore_msg:
+        st.success(restore_msg)
     if "user" not in st.session_state:
         login_ui()
         return
@@ -2990,9 +3114,18 @@ def app_main() -> None:
     with c3:
         st.caption("Los nombres de pacientes y el nombre del archivo original no se exportan.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["1. Cargar informe completo", "2. Corrección opcional de curvas", "3. Mis Excel", "4. Administración"])
+    # Navegación exclusiva: a diferencia de st.tabs, sólo ejecuta la sección
+    # visible. Esto evita montar componentes/iframes ocultos y previene el
+    # error frontend NotFoundError: removeChild durante los reruns.
+    section = st.radio(
+        "Sección",
+        ["1. Cargar informe completo", "2. Corrección opcional de curvas", "3. Mis Excel", "4. Administración"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_section_navigation",
+    )
 
-    with tab1:
+    if section == "1. Cargar informe completo":
         st.markdown("<div class='guide'><b>Función principal:</b> cargar la hoja completa del informe, extraer/corregir variables y guardar un registro anónimo en Excel. La corrección de curvas queda como módulo opcional aparte.</div>", unsafe_allow_html=True)
         uploaded = st.file_uploader("Subir PDF o imagen del informe completo", type=["pdf", "png", "jpg", "jpeg"], key="main_upload")
         if uploaded is not None:
@@ -3088,7 +3221,7 @@ def app_main() -> None:
         else:
             st.info("Suba un PDF o imagen de informe completo para comenzar.")
 
-    with tab2:
+    elif section == "2. Corrección opcional de curvas":
         st.markdown("<div class='guide'><b>Módulo opcional:</b> corrección de curvas y cursores QRS, B, C, X e Y. Use este módulo solo cuando quiera validar morfología o entrenar operadores.</div>", unsafe_allow_html=True)
         uploaded2 = st.file_uploader("Subir PDF/imagen para corrección opcional de curvas", type=["pdf", "png", "jpg", "jpeg"], key="curves_upload")
         use_last = False
@@ -3166,7 +3299,7 @@ def app_main() -> None:
         else:
             st.info("Suba un archivo o use la última hoja cargada en el módulo principal.")
 
-    with tab3:
+    elif section == "3. Mis Excel":
         st.subheader("Mis estudios guardados")
         df = studies_df(user)
         df_wide = studies_wide_df(user)
@@ -3175,7 +3308,7 @@ def app_main() -> None:
         st.download_button("Descargar mi Excel completo", data=export_excel(user, only_current_user=True), file_name=f"cgi_excel_completo_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Descargar Excel delta corrección de cursores", data=export_cursor_delta_excel(user, only_current_user=True), file_name=f"delta_correccion_cursores_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    with tab4:
+    elif section == "4. Administración":
         if user.get("role") != "admin":
             st.warning("Solo el administrador puede acceder a todos los registros.")
         else:
@@ -3191,6 +3324,7 @@ def app_main() -> None:
             all_wide = studies_wide_df(None)
             st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
             st.dataframe(all_wide, use_container_width=True)
+            backup_admin_panel()
             st.download_button("Descargar Excel administrador completo", data=export_excel(user, only_current_user=False), file_name="cgi_excel_administrador_todos_los_usuarios_COMPLETO.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.download_button("Descargar Excel administrador delta cursores", data=export_cursor_delta_excel(user, only_current_user=False), file_name="delta_correccion_cursores_ADMIN.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
