@@ -37,9 +37,25 @@ except Exception:
     fitz = None
 
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
+APP_BUILD = "CGI-ROBUST-S3-V2-20260720"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
-DATA_DIR = Path(get_secret_value("CGI_DATA_DIR", os.getenv("CGI_DATA_DIR", "cgi_data"))) if "get_secret_value" in globals() else Path(os.getenv("CGI_DATA_DIR", "cgi_data"))
+
+def _early_secret_value(name: str, default: str = "") -> str:
+    """Lee un Secret durante la inicialización temprana, antes de definir get_secret_value()."""
+    val = os.getenv(name, "")
+    if val:
+        return str(val)
+    try:
+        val = st.secrets.get(name, "")
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return default
+
+
+DATA_DIR = Path(_early_secret_value("CGI_DATA_DIR", os.getenv("CGI_DATA_DIR", "cgi_data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "cgi_repositorio_concordancia.sqlite3"
 FILES_DIR = DATA_DIR / "archivos_cgi"
@@ -220,10 +236,11 @@ def _s3_client():
     except Exception as exc:
         raise RuntimeError("Para respaldo remoto instale boto3 en requirements.txt.") from exc
     kwargs = {}
-    region = get_secret_value("AWS_DEFAULT_REGION", "")
+    region = get_secret_value("AWS_DEFAULT_REGION", get_secret_value("AWS_REGION", ""))
     endpoint = get_secret_value("CGI_S3_ENDPOINT_URL", "")
     access = get_secret_value("AWS_ACCESS_KEY_ID", "")
     secret = get_secret_value("AWS_SECRET_ACCESS_KEY", "")
+    session_token = get_secret_value("AWS_SESSION_TOKEN", "")
     if region:
         kwargs["region_name"] = region
     if endpoint:
@@ -231,6 +248,8 @@ def _s3_client():
     if access and secret:
         kwargs["aws_access_key_id"] = access
         kwargs["aws_secret_access_key"] = secret
+        if session_token:
+            kwargs["aws_session_token"] = session_token
     return boto3.client("s3", **kwargs)
 
 
@@ -259,13 +278,143 @@ def allow_empty_remote_initialization() -> bool:
     return get_secret_value("CGI_ALLOW_EMPTY_INIT", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
 
+def _s3_error_code(exc: Exception) -> str:
+    """Extrae un código AWS/botocore sin depender rígidamente de botocore."""
+    try:
+        response = getattr(exc, "response", {}) or {}
+        err = response.get("Error", {}) or {}
+        return str(err.get("Code", "") or response.get("ResponseMetadata", {}).get("HTTPStatusCode", ""))
+    except Exception:
+        return ""
+
+
+def s3_preflight_database() -> dict:
+    """
+    Diagnóstico no destructivo del repositorio remoto.
+
+    Estrategia V2:
+    1) intenta HEAD sobre el objeto exacto. Esto permite restaurar con GetObject
+       aunque la identidad no tenga ListBucket;
+    2) si HEAD devuelve 403, usa ListBucket sólo como diagnóstico secundario;
+    3) nunca crea, borra ni sobrescribe objetos.
+    """
+    result = {
+        "ok": False,
+        "bucket": get_secret_value("CGI_S3_BUCKET", "").strip(),
+        "key": get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3").lstrip("/"),
+        "exists": None,
+        "head_allowed": None,
+        "list_allowed": None,
+        "error_code": "",
+        "message": "",
+    }
+    if not result["bucket"]:
+        result["message"] = "CGI_S3_BUCKET no está configurado."
+        return result
+
+    try:
+        client = _s3_client()
+    except Exception as exc:
+        result["message"] = f"No se pudo crear el cliente S3: {exc}"
+        return result
+
+    # Primero se prueba el objeto exacto. ListBucket NO es requisito para una
+    # restauración normal si el usuario ya tiene GetObject sobre esa key.
+    try:
+        head = client.head_object(Bucket=result["bucket"], Key=result["key"])
+        result["head_allowed"] = True
+        result["exists"] = True
+        result["ok"] = True
+        result["content_length"] = int(head.get("ContentLength", 0) or 0)
+        result["etag"] = str(head.get("ETag", "") or "").strip('"')
+        result["message"] = "Respaldo remoto localizado y permiso de lectura confirmado."
+        return result
+    except Exception as exc:
+        code = _s3_error_code(exc)
+        result["error_code"] = code
+        result["head_allowed"] = False
+        head_exc = exc
+
+    code = str(result.get("error_code", ""))
+
+    # Errores suficientemente específicos sin necesitar ListBucket.
+    if code in {"404", "NoSuchKey", "NotFound"}:
+        result["exists"] = False
+        result["message"] = (
+            f"No existe el respaldo esperado: {result['key']}. Revise CGI_S3_DB_KEY. "
+            "Solo en una instalación realmente nueva habilite CGI_ALLOW_EMPTY_INIT=true una única vez."
+        )
+        return result
+    if code in {"NoSuchBucket"}:
+        result["exists"] = False
+        result["message"] = "El bucket configurado no existe. Revise CGI_S3_BUCKET y la cuenta AWS."
+        return result
+    if code in {"301", "PermanentRedirect", "AuthorizationHeaderMalformed", "IllegalLocationConstraintException"}:
+        result["message"] = (
+            "La región configurada no coincide con la del bucket. Revise AWS_DEFAULT_REGION/AWS_REGION "
+            "y la región real de CGI_S3_BUCKET."
+        )
+        return result
+    if code in {"InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken", "TokenRefreshRequired"}:
+        result["message"] = (
+            f"Las credenciales AWS no pudieron autenticarse ({code}). Revise AWS_ACCESS_KEY_ID, "
+            "AWS_SECRET_ACCESS_KEY y, si corresponde, el token de sesión."
+        )
+        return result
+
+    # Un 403 de HEAD es ambiguo: puede ser falta de GetObject o incluso un objeto
+    # inexistente cuando la identidad tampoco tiene ListBucket. Se intenta listar
+    # sólo para diagnosticar, nunca como requisito previo obligatorio.
+    if code in {"403", "AccessDenied", "Forbidden"}:
+        try:
+            listed = client.list_objects_v2(Bucket=result["bucket"], Prefix=result["key"], MaxKeys=10)
+            result["list_allowed"] = True
+            keys = {str(item.get("Key", "")) for item in listed.get("Contents", [])}
+            if result["key"] in keys:
+                result["exists"] = True
+                result["message"] = (
+                    "El respaldo existe, pero HEAD/lectura está denegado. Conceda s3:GetObject sobre la key "
+                    f"{result['key']} y revise cualquier Deny explícito en IAM o en la política del bucket."
+                )
+            else:
+                result["exists"] = False
+                result["message"] = (
+                    f"El bucket es accesible, pero no aparece la key {result['key']}. "
+                    "Revise CGI_S3_DB_KEY. Si nunca existió una base previa, habilite CGI_ALLOW_EMPTY_INIT=true una sola vez."
+                )
+            return result
+        except Exception as list_exc:
+            result["list_allowed"] = False
+            list_code = _s3_error_code(list_exc)
+            if list_code in {"301", "PermanentRedirect", "AuthorizationHeaderMalformed", "IllegalLocationConstraintException"}:
+                result["message"] = "La región del cliente S3 no coincide con la región real del bucket."
+            elif list_code in {"InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken"}:
+                result["message"] = f"Error de autenticación AWS ({list_code}). Revise las credenciales configuradas."
+            else:
+                result["message"] = (
+                    "S3 respondió 403 al consultar el respaldo exacto y tampoco permitió listar el prefijo. "
+                    "Para restaurar, la identidad necesita s3:GetObject sobre la key del respaldo. "
+                    "Para un diagnóstico inequívoco de objetos inexistentes, agregue además s3:ListBucket sobre el bucket. "
+                    "Revise también políticas del bucket, SCP/permission boundaries y cualquier Deny explícito."
+                )
+            return result
+
+    result["message"] = f"No se pudo validar S3 [{code or 'sin código'}]: {head_exc}"
+    return result
+
+
 def restore_database_from_remote_if_missing() -> tuple[bool, str]:
-    """Restaura la base remota solo después de validar integridad SQLite."""
+    """Restaura la base remota solo después de validar acceso e integridad SQLite."""
     if DB_PATH.exists() or not _s3_configured():
         return False, ""
     bucket = get_secret_value("CGI_S3_BUCKET", "")
     key = get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3")
     tmp = DB_PATH.with_suffix(".restore.tmp")
+
+    preflight = s3_preflight_database()
+    if not preflight.get("ok"):
+        return False, preflight.get("message", "No se pudo validar el repositorio remoto.")
+
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         if tmp.exists():
@@ -282,7 +431,9 @@ def restore_database_from_remote_if_missing() -> tuple[bool, str]:
                 tmp.unlink()
         except Exception:
             pass
-        return False, f"No se pudo restaurar la base remota: {exc}"
+        code = _s3_error_code(exc)
+        suffix = f" [código {code}]" if code else ""
+        return False, f"No se pudo descargar/restaurar la base remota{suffix}: {exc}"
 
 
 def restore_latest_excel_from_remote_if_missing() -> tuple[bool, str]:
@@ -395,18 +546,43 @@ def validate_excel_file(path: Path) -> None:
 
 
 def _upload_backup_to_s3(local_path: Path, remote_key: str) -> None:
+    """Sube un respaldo y verifica tamaño + checksum metadata mediante HEAD."""
     if not _s3_configured():
         return
-    bucket = get_secret_value("CGI_S3_BUCKET", "")
+    bucket = get_secret_value("CGI_S3_BUCKET", "").strip()
+    remote_key = str(remote_key or "").lstrip("/")
+    if not bucket or not remote_key:
+        raise RuntimeError("Bucket o key S3 vacíos.")
+
+    checksum = sha256_file(local_path)
     extra = {
-        "ServerSideEncryption": "AES256",
-        "Metadata": {"sha256": sha256_file(local_path), "generated-at": now_iso()},
+        "Metadata": {"sha256": checksum, "generated-at": now_iso()},
+        "ContentType": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if local_path.suffix.lower() == ".xlsx"
+            else "application/json" if local_path.suffix.lower() == ".json"
+            else "application/octet-stream"
+        ),
     }
-    if local_path.suffix.lower() == ".xlsx":
-        extra["ContentType"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    else:
-        extra["ContentType"] = "application/octet-stream"
-    _s3_client().upload_file(str(local_path), bucket, remote_key, ExtraArgs=extra)
+    default_sse = "" if get_secret_value("CGI_S3_ENDPOINT_URL", "").strip() else "AES256"
+    sse = get_secret_value("CGI_S3_SERVER_SIDE_ENCRYPTION", default_sse).strip()
+    if sse:
+        extra["ServerSideEncryption"] = sse
+
+    client = _s3_client()
+    client.upload_file(str(local_path), bucket, remote_key, ExtraArgs=extra)
+
+    # Confirmación remota: evita marcar un respaldo como exitoso si la subida
+    # fue aceptada pero el objeto final no puede verificarse.
+    head = client.head_object(Bucket=bucket, Key=remote_key)
+    remote_size = int(head.get("ContentLength", -1))
+    remote_sha = str((head.get("Metadata", {}) or {}).get("sha256", ""))
+    if remote_size != int(local_path.stat().st_size):
+        raise RuntimeError(
+            f"Verificación S3 fallida para {remote_key}: tamaño local={local_path.stat().st_size}, remoto={remote_size}."
+        )
+    if remote_sha and not secrets.compare_digest(remote_sha, checksum):
+        raise RuntimeError(f"Verificación S3 fallida para {remote_key}: checksum SHA-256 no coincide.")
 
 
 def get_system_state(key: str, default: str = "") -> str:
@@ -3492,6 +3668,17 @@ def backup_admin_panel() -> None:
             st.success("Persistencia remota S3 activa: copia estable tras cambios y corte histórico semanal versionado.")
         else:
             st.warning(f"S3 está configurado, pero el último corte no confirmó la subida: {state.get('remote_error','sin detalle')}")
+        if st.button("Diagnosticar acceso S3", key="diagnose_s3_access"):
+            diag = s3_preflight_database()
+            if diag.get("ok"):
+                st.success(diag.get("message", "S3 verificado."))
+            else:
+                st.warning(diag.get("message", "No se pudo validar S3."))
+            st.caption(
+                f"Bucket: {diag.get('bucket') or '—'} · Key: {diag.get('key') or '—'} · "
+                f"Existe: {diag.get('exists')} · HEAD: {diag.get('head_allowed')} · LIST: {diag.get('list_allowed')} · "
+                f"Código: {diag.get('error_code') or '—'}"
+            )
     else:
         st.error(
             "Persistencia remota no configurada. El Excel local puede perderse en un reinicio o redeploy. "
@@ -3553,9 +3740,18 @@ def app_main() -> None:
     if not DB_PATH.exists():
         restored, restore_msg = restore_database_from_remote_if_missing()
         if _s3_configured() and not restored and not allow_empty_remote_initialization():
-            st.error("Protección de datos activada: no se creó una base vacía porque falló la restauración remota.")
+            st.error("Protección de datos activada: no se creó una base vacía porque el repositorio remoto no pudo validarse/restaurarse.")
             st.code(restore_msg or "No se pudo recuperar la base remota.")
-            st.info("Revise CGI_S3_BUCKET, CGI_S3_DB_KEY y las credenciales. Para una instalación completamente nueva, defina CGI_ALLOW_EMPTY_INIT=true una sola vez.")
+            st.caption(
+                f"Bucket configurado: {get_secret_value('CGI_S3_BUCKET','—')} · "
+                f"Key esperada: {get_secret_value('CGI_S3_DB_KEY','cgi-backups/latest/cgi_repositorio.sqlite3')} · "
+                f"Región: {get_secret_value('AWS_DEFAULT_REGION', get_secret_value('AWS_REGION','—')) or '—'}"
+            )
+            st.info(
+                "No active CGI_ALLOW_EMPTY_INIT=true si esta app ya tenía usuarios o estudios. "
+                "Primero corrija bucket/key/región/permisos. La nueva comprobación intenta el objeto exacto antes de exigir ListBucket, "
+                "por lo que una política mínima con GetObject puede restaurar normalmente."
+            )
             st.stop()
     init_db()
     integrity = database_integrity_summary()
