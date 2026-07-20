@@ -37,7 +37,7 @@ except Exception:
     fitz = None
 
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
-APP_BUILD = "CGI-ROBUST-S3-V2-20260720"
+APP_BUILD = "CGI-ROBUST-S3-V4-20260720"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
 
@@ -222,8 +222,89 @@ def get_secret_value(name: str, default: str = "") -> str:
 
 
 
+S3_PLACEHOLDER_VALUES = {
+    "NOMBRE-EXACTO-DEL-BUCKET",
+    "NOMBRE_DEL_BUCKET",
+    "REEMPLAZAR_NOMBRE_BUCKET",
+    "REGION-REAL-DEL-BUCKET",
+    "REGION_REAL_DEL_BUCKET",
+    "AWS_ACCESS_KEY_ID_AQUI",
+    "AWS_SECRET_ACCESS_KEY_AQUI",
+    "SU_ACCESS_KEY",
+    "SU_SECRET_KEY",
+    "AQUI-VA-EL-NOMBRE-REAL-DE-TU-BUCKET",
+    "AQUI_VA_EL_NOMBRE_REAL_DE_TU_BUCKET",
+    "AQUI-VA-LA-REGION-REAL",
+    "AQUI_VA_LA_REGION_REAL",
+    "AQUI-VA-TU-ACCESS-KEY",
+    "AQUI-VA-TU-SECRET-KEY",
+}
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """Detecta valores de ejemplo copiados literalmente en Streamlit Secrets."""
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    upper = raw.upper()
+    if upper in S3_PLACEHOLDER_VALUES:
+        return True
+    markers = (
+        "NOMBRE-EXACTO-DEL-BUCKET", "REGION-REAL-DEL-BUCKET",
+        "REEMPLAZAR_", "REEMPLAZAR-", "YOUR_BUCKET", "YOUR-BUCKET",
+        "YOUR_REGION", "YOUR-REGION", "<BUCKET", "<REGION",
+        "NOMBRE_DEL_BUCKET", "REGION_REAL_DEL_BUCKET",
+        "AQUI-VA-", "AQUI_VA_", "AQUÍ-VA-", "AQUÍ_VA_",
+        "AQUI VA ", "AQUÍ VA ", "TU-BUCKET", "TU_BUCKET",
+        "TU-REGION", "TU_REGION",
+    )
+    return any(marker in upper for marker in markers)
+
+
+def s3_configuration_status() -> dict:
+    """Valida configuración S3 sin realizar conexiones ni exponer secretos."""
+    bucket = get_secret_value("CGI_S3_BUCKET", "").strip()
+    region = get_secret_value("AWS_DEFAULT_REGION", get_secret_value("AWS_REGION", "")).strip()
+    endpoint = get_secret_value("CGI_S3_ENDPOINT_URL", "").strip()
+    access = get_secret_value("AWS_ACCESS_KEY_ID", "").strip()
+    secret = get_secret_value("AWS_SECRET_ACCESS_KEY", "").strip()
+
+    invalid = []
+    if _looks_like_placeholder(bucket):
+        invalid.append("CGI_S3_BUCKET contiene un valor de ejemplo y debe reemplazarse por el nombre real del bucket.")
+    if _looks_like_placeholder(region):
+        invalid.append("AWS_DEFAULT_REGION/AWS_REGION contiene un valor de ejemplo y debe reemplazarse por la región real, por ejemplo us-east-1 o sa-east-1.")
+    if _looks_like_placeholder(endpoint):
+        invalid.append("CGI_S3_ENDPOINT_URL contiene un valor de ejemplo. Déjelo vacío para AWS S3 estándar.")
+    if _looks_like_placeholder(access):
+        invalid.append("AWS_ACCESS_KEY_ID contiene un valor de ejemplo.")
+    if _looks_like_placeholder(secret):
+        invalid.append("AWS_SECRET_ACCESS_KEY contiene un valor de ejemplo.")
+
+    # Validaciones sintácticas conservadoras adicionales. No prueban que el
+    # recurso exista, pero evitan construir endpoints claramente inválidos.
+    if bucket and not _looks_like_placeholder(bucket):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or ".." in bucket:
+            invalid.append("CGI_S3_BUCKET no tiene formato de nombre de bucket S3 válido.")
+    if region and not _looks_like_placeholder(region):
+        if not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z0-9-]+-\d", region):
+            invalid.append("AWS_DEFAULT_REGION/AWS_REGION no parece una región AWS válida (por ejemplo sa-east-1).")
+
+    intended = bool(bucket or region or endpoint or access or secret)
+    configured = bool(bucket) and not invalid
+    return {
+        "configured": configured,
+        "intended": intended,
+        "invalid": invalid,
+        "bucket": bucket,
+        "region": region,
+        "endpoint": endpoint,
+    }
+
+
 def _s3_configured() -> bool:
-    return bool(get_secret_value("CGI_S3_BUCKET", ""))
+    """True solo cuando el bucket es real y no quedaron placeholders de ejemplo."""
+    return bool(s3_configuration_status().get("configured"))
 
 
 def _s3_client():
@@ -231,6 +312,11 @@ def _s3_client():
     El uso de almacenamiento externo es la única forma de conservar datos
     frente a reinicios o redeploys del disco efímero de Streamlit Cloud.
     """
+    cfg = s3_configuration_status()
+    if cfg.get("invalid"):
+        raise RuntimeError("Configuración S3 inválida: " + " ".join(cfg["invalid"]))
+    if not cfg.get("bucket"):
+        raise RuntimeError("CGI_S3_BUCKET no está configurado.")
     try:
         import boto3
     except Exception as exc:
@@ -308,8 +394,14 @@ def s3_preflight_database() -> dict:
         "error_code": "",
         "message": "",
     }
+    cfg = s3_configuration_status()
+    if cfg.get("invalid"):
+        result["message"] = "Configuración S3 incompleta o con valores de ejemplo: " + " ".join(cfg["invalid"])
+        result["error_code"] = "CONFIG_PLACEHOLDER"
+        return result
     if not result["bucket"]:
         result["message"] = "CGI_S3_BUCKET no está configurado."
+        result["error_code"] = "NOT_CONFIGURED"
         return result
 
     try:
@@ -3738,21 +3830,52 @@ def app_main() -> None:
     restored = False
     restore_msg = ""
     if not DB_PATH.exists():
-        restored, restore_msg = restore_database_from_remote_if_missing()
-        if _s3_configured() and not restored and not allow_empty_remote_initialization():
-            st.error("Protección de datos activada: no se creó una base vacía porque el repositorio remoto no pudo validarse/restaurarse.")
-            st.code(restore_msg or "No se pudo recuperar la base remota.")
-            st.caption(
-                f"Bucket configurado: {get_secret_value('CGI_S3_BUCKET','—')} · "
-                f"Key esperada: {get_secret_value('CGI_S3_DB_KEY','cgi-backups/latest/cgi_repositorio.sqlite3')} · "
-                f"Región: {get_secret_value('AWS_DEFAULT_REGION', get_secret_value('AWS_REGION','—')) or '—'}"
+        cfg = s3_configuration_status()
+
+        # Nunca tratamos textos de ejemplo como una configuración S3 real.
+        # Tampoco creamos silenciosamente una base vacía cuando falta la base local.
+        if cfg.get("invalid"):
+            st.error("Configuración de persistencia incompleta: se detectaron valores de ejemplo en Streamlit Secrets.")
+            for problem in cfg.get("invalid", []):
+                st.warning(problem)
+            st.code(
+                'CGI_S3_BUCKET = "nombre-real-del-bucket"\n'
+                'AWS_DEFAULT_REGION = "region-real"\n'
+                'CGI_S3_DB_KEY = "cgi-backups/latest/cgi_repositorio.sqlite3"\n'
+                'CGI_ALLOW_EMPTY_INIT = false'
             )
             st.info(
-                "No active CGI_ALLOW_EMPTY_INIT=true si esta app ya tenía usuarios o estudios. "
-                "Primero corrija bucket/key/región/permisos. La nueva comprobación intenta el objeto exacto antes de exigir ListBucket, "
-                "por lo que una política mínima con GetObject puede restaurar normalmente."
+                "No escriba literalmente textos de ejemplo como NOMBRE-EXACTO-DEL-BUCKET, REGION-REAL-DEL-BUCKET, "
+                "AQUI-VA-EL-NOMBRE-REAL-DE-TU-BUCKET o AQUI-VA-LA-REGION-REAL. "
+                "Si la app ya tenía usuarios o estudios, mantenga CGI_ALLOW_EMPTY_INIT=false."
             )
             st.stop()
+
+        if cfg.get("configured"):
+            restored, restore_msg = restore_database_from_remote_if_missing()
+            if not restored and not allow_empty_remote_initialization():
+                st.error("Protección de datos activada: no se creó una base vacía porque el repositorio remoto no pudo validarse/restaurarse.")
+                st.code(restore_msg or "No se pudo recuperar la base remota.")
+                st.caption(
+                    f"Bucket configurado: {cfg.get('bucket') or '—'} · "
+                    f"Key esperada: {get_secret_value('CGI_S3_DB_KEY','cgi-backups/latest/cgi_repositorio.sqlite3')} · "
+                    f"Región: {cfg.get('region') or 'automática/no especificada'}"
+                )
+                st.info(
+                    "No active CGI_ALLOW_EMPTY_INIT=true si esta app ya tenía usuarios o estudios. "
+                    "Primero corrija bucket/key/región/permisos."
+                )
+                st.stop()
+        else:
+            # Sin DB local y sin S3 válido: exige una inicialización explícita.
+            # Esto evita perder visualmente usuarios/estudios tras un redeploy.
+            if not allow_empty_remote_initialization():
+                st.error("Protección de datos activada: no existe una base local y no hay un repositorio remoto S3 válido configurado.")
+                st.info(
+                    "Configure un bucket S3 real para restaurar la base histórica. "
+                    "Solo para una instalación completamente nueva, sin usuarios ni estudios previos, active CGI_ALLOW_EMPTY_INIT=true una sola vez."
+                )
+                st.stop()
     init_db()
     integrity = database_integrity_summary()
     if not integrity.get("ok"):
