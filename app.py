@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import sqlite3
 import traceback
 import shutil
 import tempfile
+import threading
 from datetime import timedelta
 from datetime import date, datetime
 from pathlib import Path
@@ -44,7 +46,16 @@ FILES_DIR = DATA_DIR / "archivos_cgi"
 BACKUP_DIR = DATA_DIR / "respaldos"
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BACKUP_INTERVAL_HOURS = 72
+BACKUP_INTERVAL_HOURS = 24 * 7  # respaldo histórico semanal
+BACKUP_RETENTION_COUNT = 52     # conserva hasta un año de cortes semanales
+BACKUP_LOCK = threading.RLock()
+PASSWORD_MIN_LENGTH = 12
+ADMIN_PASSWORD_MIN_LENGTH = 14
+PASSWORD_MAX_LENGTH = 128
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+SESSION_IDLE_MINUTES = 30
+SESSION_ABSOLUTE_HOURS = 8
 BACKUP_STATE_FILE = BACKUP_DIR / "ultimo_respaldo.json"
 ADMIN_USER_DEFAULT = os.getenv("CGI_ADMIN_USER", "olan")
 CURSORS = ["QRS", "B", "C", "X", "Y"]
@@ -98,21 +109,84 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _password_material(password: str) -> bytes:
+    """Prepara la clave para el KDF y permite un pepper opcional fuera de la DB."""
+    raw = str(password or "").encode("utf-8")
+    pepper = os.getenv("CGI_PASSWORD_PEPPER", "")
+    if not pepper:
+        try:
+            pepper = str(st.secrets.get("CGI_PASSWORD_PEPPER", ""))
+        except Exception:
+            pepper = ""
+    if pepper:
+        return hmac.new(pepper.encode("utf-8"), raw, hashlib.sha256).digest()
+    return raw
+
+
 def hash_password(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
-    return f"pbkdf2_sha256${salt}${dk.hex()}"
+    """Hash versionado con scrypt; nunca guarda ni cifra reversiblemente la clave."""
+    salt_bytes = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
+    n, r, p = 2**14, 8, 5
+    digest = hashlib.scrypt(_password_material(password), salt=salt_bytes, n=n, r=r, p=p, dklen=32)
+    return f"scrypt$n={n},r={r},p={p}${salt_bytes.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, stored: str) -> bool:
+    """Verifica scrypt y mantiene compatibilidad con hashes PBKDF2 anteriores."""
     try:
+        if stored.startswith("scrypt$"):
+            _, params, salt_hex, digest_hex = stored.split("$", 3)
+            values = dict(part.split("=", 1) for part in params.split(","))
+            digest = hashlib.scrypt(
+                _password_material(password),
+                salt=bytes.fromhex(salt_hex),
+                n=int(values["n"]), r=int(values["r"]), p=int(values["p"]), dklen=32,
+            ).hex()
+            return secrets.compare_digest(digest, digest_hex)
         algo, salt, digest = stored.split("$", 2)
         if algo != "pbkdf2_sha256":
             return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
-        return secrets.compare_digest(dk, digest)
+        legacy = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
+        return secrets.compare_digest(legacy, digest)
     except Exception:
         return False
+
+
+def password_needs_upgrade(stored: str) -> bool:
+    return not str(stored or "").startswith("scrypt$n=16384,r=8,p=5$")
+
+
+COMMON_PASSWORDS = {
+    "123456789012", "password1234", "contraseña123", "administrador",
+    "qwertyuiop12", "streamlit123", "cardiologia123", "argentina123",
+}
+
+
+def validate_password(password: str, username: str = "", role: str = "user", full_name: str = "") -> tuple[bool, str]:
+    password = str(password or "")
+    minimum = ADMIN_PASSWORD_MIN_LENGTH if role == "admin" else PASSWORD_MIN_LENGTH
+    if len(password) < minimum:
+        return False, f"La clave debe tener al menos {minimum} caracteres."
+    if len(password) > PASSWORD_MAX_LENGTH:
+        return False, f"La clave no puede superar {PASSWORD_MAX_LENGTH} caracteres."
+    normalized = password.casefold().strip()
+    if normalized in COMMON_PASSWORDS:
+        return False, "La clave elegida es demasiado frecuente. Use una frase de acceso única."
+    for value in (username, full_name):
+        token = re.sub(r"[^a-z0-9áéíóúüñ]", "", str(value or "").casefold())
+        if len(token) >= 4 and token in re.sub(r"\s+", "", normalized):
+            return False, "La clave no debe contener el usuario ni el nombre del operador."
+    if len(set(password)) < 6:
+        return False, "La clave contiene muy poca variedad de caracteres."
+    return True, ""
+
+
+def password_strength_label(password: str) -> str:
+    p = str(password or "")
+    score = int(len(p) >= 12) + int(len(p) >= 16) + int(len(p) >= 20)
+    score += int(any(c.islower() for c in p) and any(c.isupper() for c in p))
+    score += int(any(c.isdigit() for c in p) or any(not c.isalnum() for c in p))
+    return "fuerte" if score >= 4 else ("aceptable" if score >= 3 else "débil")
 
 
 def get_secret_value(name: str, default: str = "") -> str:
@@ -186,21 +260,52 @@ def allow_empty_remote_initialization() -> bool:
 
 
 def restore_database_from_remote_if_missing() -> tuple[bool, str]:
-    """Restaura automáticamente la base más reciente si el archivo local no existe."""
+    """Restaura la base remota solo después de validar integridad SQLite."""
     if DB_PATH.exists() or not _s3_configured():
         return False, ""
     bucket = get_secret_value("CGI_S3_BUCKET", "")
     key = get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3")
+    tmp = DB_PATH.with_suffix(".restore.tmp")
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DB_PATH.with_suffix(".restore.tmp")
+        if tmp.exists():
+            tmp.unlink()
         _s3_client().download_file(bucket, key, str(tmp))
-        if tmp.exists() and tmp.stat().st_size > 0:
-            tmp.replace(DB_PATH)
-            return True, "Base de usuarios y estudios restaurada desde almacenamiento remoto."
+        check = database_integrity_summary(tmp)
+        if not check.get("ok"):
+            raise RuntimeError(f"copia remota inválida: {check.get('error','sin detalle')}")
+        tmp.replace(DB_PATH)
+        return True, "Base de usuarios y estudios restaurada y validada desde almacenamiento remoto."
     except Exception as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
         return False, f"No se pudo restaurar la base remota: {exc}"
-    return False, "No se encontró una copia remota válida."
+
+
+def restore_latest_excel_from_remote_if_missing() -> tuple[bool, str]:
+    """Recupera el Excel estable para que siga disponible tras un redeploy."""
+    latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    if latest.exists() or not _s3_configured():
+        return False, ""
+    bucket = get_secret_value("CGI_S3_BUCKET", "")
+    prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
+    key = get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx")
+    tmp = latest.with_suffix(".restore.tmp.xlsx")
+    try:
+        _s3_client().download_file(bucket, key, str(tmp))
+        validate_excel_file(tmp)
+        tmp.replace(latest)
+        return True, "Excel histórico recuperado desde almacenamiento remoto."
+    except Exception as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False, f"No se pudo recuperar el Excel remoto: {exc}"
 
 
 def database_integrity_summary(path: Path | None = None) -> dict:
@@ -258,12 +363,71 @@ def create_sqlite_snapshot(target: Path) -> Path:
     return target
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+    return path
+
+
+def validate_excel_file(path: Path) -> None:
+    if not path.exists() or path.stat().st_size <= 0:
+        raise RuntimeError("El Excel está vacío.")
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        required = {"estudios", "diccionario_variables"}
+        missing = required.difference(set(wb.sheetnames))
+        wb.close()
+        if missing:
+            raise RuntimeError(f"Faltan hojas obligatorias: {', '.join(sorted(missing))}")
+    except ImportError as exc:
+        raise RuntimeError("Falta openpyxl para validar el repositorio Excel.") from exc
+
+
 def _upload_backup_to_s3(local_path: Path, remote_key: str) -> None:
     if not _s3_configured():
         return
     bucket = get_secret_value("CGI_S3_BUCKET", "")
-    extra = {"ServerSideEncryption": "AES256"}
+    extra = {
+        "ServerSideEncryption": "AES256",
+        "Metadata": {"sha256": sha256_file(local_path), "generated-at": now_iso()},
+    }
+    if local_path.suffix.lower() == ".xlsx":
+        extra["ContentType"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        extra["ContentType"] = "application/octet-stream"
     _s3_client().upload_file(str(local_path), bucket, remote_key, ExtraArgs=extra)
+
+
+def get_system_state(key: str, default: str = "") -> str:
+    try:
+        con = connect()
+        row = con.execute("SELECT value FROM system_state WHERE key=?", (key,)).fetchone()
+        con.close()
+        return str(row["value"]) if row else default
+    except Exception:
+        return default
+
+
+def set_system_state(key: str, value: str) -> None:
+    con = connect()
+    con.execute(
+        "INSERT INTO system_state(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, str(value), now_iso()),
+    )
+    con.commit()
+    con.close()
 
 
 def read_backup_state() -> dict:
@@ -280,8 +444,9 @@ def write_backup_state(data: dict) -> None:
 
 
 def backup_due(hours: int = BACKUP_INTERVAL_HOURS) -> bool:
-    state = read_backup_state()
-    raw = state.get("created_at", "")
+    raw = get_system_state("last_weekly_backup_at", "")
+    if not raw:
+        raw = read_backup_state().get("created_at", "")
     try:
         last = datetime.fromisoformat(raw)
         return datetime.now() - last >= timedelta(hours=int(hours))
@@ -290,20 +455,42 @@ def backup_due(hours: int = BACKUP_INTERVAL_HOURS) -> bool:
 
 
 def preserve_database_after_write(reason: str = "actualizacion") -> None:
-    """Mantiene una copia local rotativa después de cada cambio de credenciales o datos."""
+    """Sincroniza copia estable de DB y Excel después de cada modificación."""
     try:
-        latest = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
-        create_sqlite_snapshot(latest)
-        # Se actualiza también la copia remota estable si está configurada.
-        if _s3_configured():
-            _upload_backup_to_s3(latest, get_secret_value("CGI_S3_DB_KEY", "cgi-backups/latest/cgi_repositorio.sqlite3"))
-    except Exception:
-        # Nunca interrumpe el guardado clínico por un fallo secundario de respaldo.
-        pass
+        with BACKUP_LOCK:
+            latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+            latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+            create_sqlite_snapshot(latest_db)
+            excel_builder = globals().get("export_excel")
+            if callable(excel_builder):
+                atomic_write_bytes(latest_xlsx, excel_builder({}, only_current_user=False))
+                validate_excel_file(latest_xlsx)
+            if _s3_configured():
+                prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
+                _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
+                if latest_xlsx.exists():
+                    _upload_backup_to_s3(latest_xlsx, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
+            set_system_state("last_persist_reason", reason)
+            set_system_state("last_persist_at", now_iso())
+    except Exception as exc:
+        try:
+            set_system_state("last_persist_error", str(exc)[:500])
+        except Exception:
+            pass
+
+
+def _ensure_column(con: sqlite3.Connection, table: str, column: str, definition: str) -> bool:
+    cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in cols:
+        return False
+    con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    return True
+
 
 def init_db() -> None:
     con = connect()
     cur = con.cursor()
+    schema_changed = False
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users(
@@ -319,6 +506,16 @@ def init_db() -> None:
         )
         """
     )
+    for column, definition in [
+        ("failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("locked_until", "TEXT"),
+        ("last_failed_at", "TEXT"),
+        ("last_login_at", "TEXT"),
+        ("password_changed_at", "TEXT"),
+        ("must_change_password", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        schema_changed = _ensure_column(con, "users", column, definition) or schema_changed
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS studies(
@@ -364,40 +561,107 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_audit(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            username TEXT,
+            event_type TEXT NOT NULL,
+            detail TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_state(
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_studies_created_at ON studies(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_studies_user_id ON studies(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_studies_patient_code ON studies(patient_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_audit_created_at ON auth_audit(created_at)")
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_nocase ON users(lower(username))")
+    except sqlite3.IntegrityError:
+        # No elimina ni fusiona usuarios existentes; evita una migración destructiva.
+        pass
     con.commit()
-    n = cur.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-    admin_user = get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT)
+
+    n = int(cur.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"])
+    admin_created = False
+    admin_user = get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT).strip()
     admin_pass = get_secret_value("CGI_ADMIN_PASS", "")
     if n == 0 and admin_pass:
-        cur.execute(
-            "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (admin_user, hash_password(admin_pass), "Administrador", "", "", "admin", 1, now_iso()),
+        valid, _ = validate_password(admin_pass, admin_user, "admin", "Administrador")
+        if valid:
+            cur.execute(
+                "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (admin_user, hash_password(admin_pass), "Administrador", "", "", "admin", 1, now_iso(), now_iso()),
+            )
+            con.commit()
+            admin_created = True
+    con.close()
+    if schema_changed or admin_created:
+        preserve_database_after_write("migracion_seguridad" if schema_changed else "alta_admin_secrets")
+
+
+def audit_auth_event(username: str, event_type: str, detail: str = "") -> None:
+    try:
+        con = connect()
+        con.execute(
+            "INSERT INTO auth_audit(created_at,username,event_type,detail) VALUES(?,?,?,?)",
+            (now_iso(), str(username or "")[:100], str(event_type)[:80], str(detail or "")[:500]),
         )
         con.commit()
-    con.close()
-    # Crea/actualiza inmediatamente una copia consistente después de inicializar.
-    preserve_database_after_write("inicializacion_base")
+        con.close()
+    except Exception:
+        pass
 
 
 def get_user(username: str):
     con = connect()
-    row = con.execute("SELECT * FROM users WHERE lower(username)=lower(?)", (username.strip(),)).fetchone()
+    row = con.execute("SELECT * FROM users WHERE lower(username)=lower(?)", ((username or "").strip(),)).fetchone()
     con.close()
     return row
 
 
-def create_user(username: str, password: str, full_name: str, matricula: str, provincia: str) -> Tuple[bool, str]:
-    username = username.strip()
-    if len(username) < 3 or len(password) < 6 or not full_name.strip() or not matricula.strip() or not provincia.strip():
-        return False, "Complete usuario, contraseña de al menos 6 caracteres, nombre, matrícula y provincia."
+def allow_self_registration() -> bool:
+    return get_secret_value("CGI_ALLOW_SELF_REGISTRATION", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
+
+
+def registration_token_ok(typed: str) -> bool:
+    configured = get_secret_value("CGI_USER_REGISTRATION_TOKEN", "")
+    if not configured:
+        return False
+    return secrets.compare_digest(str(typed or ""), configured)
+
+
+def create_user(username: str, password: str, full_name: str, matricula: str, provincia: str, must_change_password: int = 0) -> Tuple[bool, str]:
+    username = (username or "").strip()
+    full_name = (full_name or "").strip()
+    if len(username) < 3 or not re.fullmatch(r"[A-Za-z0-9._-]+", username):
+        return False, "El usuario debe tener al menos 3 caracteres y usar solo letras, números, punto, guion o guion bajo."
+    if not full_name or not str(matricula or "").strip() or not str(provincia or "").strip():
+        return False, "Complete nombre, matrícula y provincia."
+    valid, msg = validate_password(password, username, "user", full_name)
+    if not valid:
+        return False, msg
+    if get_user(username):
+        return False, "Ese usuario ya existe."
     try:
         con = connect()
         con.execute(
-            "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (username, hash_password(password), full_name.strip(), matricula.strip(), provincia.strip(), "user", 1, now_iso()),
+            "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (username, hash_password(password), full_name, str(matricula).strip(), str(provincia).strip(), "user", 1, now_iso(), now_iso(), int(bool(must_change_password))),
         )
         con.commit()
         con.close()
+        audit_auth_event(username, "user_created", "Alta de usuario")
         preserve_database_after_write("alta_usuario")
         return True, "Usuario registrado. Ya puede ingresar."
     except sqlite3.IntegrityError:
@@ -411,121 +675,247 @@ def admin_exists() -> bool:
     return bool(row and int(row["n"]) > 0)
 
 
-def generate_password(length: int = 16) -> str:
+def generate_password(length: int = 20) -> str:
     """Genera una clave fuerte, legible y no almacenada en texto plano."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*"
-    return "".join(secrets.choice(alphabet) for _ in range(max(12, int(length))))
+    return "".join(secrets.choice(alphabet) for _ in range(max(16, int(length))))
 
 
 def normalize_setup_token(token: str) -> str:
-    """Permite CREAR-ADMIN, CREAR ADMIN o crear_admin sin errores de guion/espacio."""
     return re.sub(r"[^A-Z0-9]+", "", str(token or "").upper())
 
 
 def setup_token_ok(typed_token: str, configured_token: str) -> bool:
-    """Valida token de instalación tolerando guiones, espacios y mayúsculas/minúsculas."""
     cfg = normalize_setup_token(configured_token)
     typed = normalize_setup_token(typed_token)
-    if not cfg:
-        return True
-    return bool(typed and secrets.compare_digest(typed, cfg))
+    return bool(cfg and len(cfg) >= 12 and typed and secrets.compare_digest(typed, cfg))
 
 
 def create_admin_user(username: str, password: str, full_name: str = "Administrador") -> Tuple[bool, str]:
     username = (username or "").strip()
-    if len(username) < 3 or len(password) < 8:
-        return False, "El usuario debe tener al menos 3 caracteres y la clave de administrador al menos 8."
+    full_name = (full_name or "Administrador").strip() or "Administrador"
+    if len(username) < 3 or not re.fullmatch(r"[A-Za-z0-9._-]+", username):
+        return False, "El usuario administrador debe tener al menos 3 caracteres válidos."
+    valid, msg = validate_password(password, username, "admin", full_name)
+    if not valid:
+        return False, msg
     try:
         con = connect()
-        con.execute(
-            "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (username, hash_password(password), full_name.strip() or "Administrador", "ADMIN", "", "admin", 1, now_iso()),
-        )
+        existing = con.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+        if existing:
+            con.execute(
+                "UPDATE users SET password_hash=?, full_name=?, role='admin', active=1, failed_attempts=0, locked_until=NULL, password_changed_at=?, must_change_password=0 WHERE id=?",
+                (hash_password(password), full_name, now_iso(), int(existing["id"])),
+            )
+            result = "Usuario existente convertido o actualizado como administrador."
+        else:
+            con.execute(
+                "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (username, hash_password(password), full_name, "ADMIN", "", "admin", 1, now_iso(), now_iso()),
+            )
+            result = "Administrador creado. La clave solo se mostró una vez."
         con.commit()
         con.close()
+        audit_auth_event(username, "admin_created_or_updated", "Rol administrador")
         preserve_database_after_write("alta_administrador")
-        return True, "Administrador creado. La clave solo se mostró una vez."
+        return True, result
     except sqlite3.IntegrityError:
-        con = connect()
-        row = con.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
-        if not row:
-            con.close()
-            return False, "No se pudo crear el administrador."
-        con.execute(
-            "UPDATE users SET password_hash=?, role='admin', active=1 WHERE id=?",
-            (hash_password(password), int(row["id"])),
-        )
-        con.commit()
-        con.close()
-        preserve_database_after_write("conversion_administrador")
-        return True, "Usuario existente convertido en administrador. La clave solo se mostró una vez."
+        return False, "No se pudo crear el administrador por duplicidad de usuario."
 
 
-def set_user_password(username: str, password: str) -> Tuple[bool, str]:
+def set_user_password(username: str, password: str, force_change: bool = False) -> Tuple[bool, str]:
     username = (username or "").strip()
-    if len(password) < 8:
-        return False, "La clave debe tener al menos 8 caracteres."
     con = connect()
-    row = con.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+    row = con.execute("SELECT id,role,full_name FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
     if not row:
         con.close()
         return False, "Usuario no encontrado."
-    con.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), int(row["id"])))
+    valid, msg = validate_password(password, username, str(row["role"]), str(row["full_name"] or ""))
+    if not valid:
+        con.close()
+        return False, msg
+    con.execute(
+        "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?, failed_attempts=0, locked_until=NULL WHERE id=?",
+        (hash_password(password), now_iso(), int(bool(force_change)), int(row["id"])),
+    )
     con.commit()
     con.close()
+    audit_auth_event(username, "password_reset", "Cambio de clave por administrador" if force_change else "Cambio de clave")
     preserve_database_after_write("cambio_clave")
-    return True, "Clave actualizada. No queda visible para otros usuarios."
+    return True, "Clave actualizada y bloqueo de acceso reiniciado."
+
+
+def change_own_password(user: dict, current_password: str, new_password: str) -> Tuple[bool, str]:
+    row = get_user(user.get("username", ""))
+    if not row or not verify_password(current_password, row["password_hash"]):
+        audit_auth_event(user.get("username", ""), "password_change_failed", "Clave actual incorrecta")
+        return False, "La contraseña actual no es correcta."
+    ok, msg = set_user_password(user.get("username", ""), new_password, force_change=False)
+    if ok:
+        refreshed = get_user(user.get("username", ""))
+        st.session_state.user = dict(refreshed)
+    return ok, msg
 
 
 def set_user_role(username: str, role: str, active: int = 1) -> Tuple[bool, str]:
     username = (username or "").strip()
     role = "admin" if role == "admin" else "user"
+    active = int(bool(active))
     con = connect()
-    row = con.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+    row = con.execute("SELECT id,role,active FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
     if not row:
         con.close()
         return False, "Usuario no encontrado."
-    con.execute("UPDATE users SET role=?, active=? WHERE id=?", (role, int(active), int(row["id"])))
+    if row["role"] == "admin" and int(row["active"]) == 1 and (role != "admin" or active == 0):
+        remaining = int(con.execute(
+            "SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (int(row["id"]),)
+        ).fetchone()[0])
+        if remaining == 0:
+            con.close()
+            return False, "No se puede desactivar ni degradar al último administrador activo."
+    con.execute("UPDATE users SET role=?, active=? WHERE id=?", (role, active, int(row["id"])))
     con.commit()
     con.close()
+    audit_auth_event(username, "role_or_status_changed", f"role={role}; active={active}")
     preserve_database_after_write("cambio_rol")
-    return True, f"Usuario actualizado como {role}."
+    return True, f"Usuario actualizado como {role}; activo={bool(active)}."
+
+
+def authenticate_user(username: str, password: str) -> tuple[bool, str, dict | None]:
+    username = (username or "").strip()
+    row = get_user(username)
+    generic = "Usuario o contraseña incorrectos."
+    if not row:
+        audit_auth_event(username, "login_failed", "Usuario inexistente")
+        return False, generic, None
+    if not int(row["active"]):
+        audit_auth_event(username, "login_failed", "Usuario inactivo")
+        return False, generic, None
+    locked_until = row["locked_until"]
+    if locked_until:
+        try:
+            until = datetime.fromisoformat(str(locked_until))
+            if datetime.now() < until:
+                minutes = max(1, int((until - datetime.now()).total_seconds() // 60) + 1)
+                audit_auth_event(username, "login_blocked", f"Bloqueado {minutes} min")
+                return False, f"Acceso temporalmente bloqueado. Intente nuevamente en aproximadamente {minutes} minutos.", None
+        except Exception:
+            pass
+    if verify_password(password, row["password_hash"]):
+        con = connect()
+        new_hash = hash_password(password) if password_needs_upgrade(row["password_hash"]) else row["password_hash"]
+        con.execute(
+            "UPDATE users SET failed_attempts=0, locked_until=NULL, last_failed_at=NULL, last_login_at=?, password_hash=? WHERE id=?",
+            (now_iso(), new_hash, int(row["id"])),
+        )
+        con.commit()
+        con.close()
+        audit_auth_event(username, "login_success", "Hash actualizado" if new_hash != row["password_hash"] else "Ingreso correcto")
+        if new_hash != row["password_hash"]:
+            preserve_database_after_write("migracion_hash_clave")
+        return True, "Ingreso correcto.", dict(get_user(username))
+
+    attempts = int(row["failed_attempts"] or 0) + 1
+    lock_until = None
+    if attempts >= MAX_LOGIN_ATTEMPTS:
+        lock_until = (datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)).isoformat(timespec="seconds")
+        attempts = 0
+    con = connect()
+    con.execute(
+        "UPDATE users SET failed_attempts=?, last_failed_at=?, locked_until=? WHERE id=?",
+        (attempts, now_iso(), lock_until, int(row["id"])),
+    )
+    con.commit()
+    con.close()
+    audit_auth_event(username, "login_failed", "Bloqueo temporal aplicado" if lock_until else f"Intento {attempts}")
+    if lock_until:
+        return False, f"Demasiados intentos fallidos. Acceso bloqueado por {LOCKOUT_MINUTES} minutos.", None
+    return False, generic, None
+
+
+def start_authenticated_session(user: dict) -> None:
+    now = now_iso()
+    st.session_state.user = dict(user)
+    st.session_state.auth_login_at = now
+    st.session_state.auth_last_activity = now
+    st.session_state.auth_session_nonce = secrets.token_urlsafe(24)
+
+
+def enforce_session_security() -> bool:
+    if "user" not in st.session_state:
+        return False
+    try:
+        login_at = datetime.fromisoformat(st.session_state.get("auth_login_at", now_iso()))
+        last = datetime.fromisoformat(st.session_state.get("auth_last_activity", now_iso()))
+        now = datetime.now()
+        if now - last > timedelta(minutes=SESSION_IDLE_MINUTES) or now - login_at > timedelta(hours=SESSION_ABSOLUTE_HOURS):
+            username = st.session_state.user.get("username", "")
+            audit_auth_event(username, "session_expired", "Tiempo de sesión agotado")
+            for key in ["user", "auth_login_at", "auth_last_activity", "auth_session_nonce"]:
+                st.session_state.pop(key, None)
+            st.warning("La sesión venció por seguridad. Ingrese nuevamente.")
+            return False
+        st.session_state.auth_last_activity = now_iso()
+        return True
+    except Exception:
+        st.session_state.auth_last_activity = now_iso()
+        return True
+
+
+def forced_password_change_ui(user: dict) -> None:
+    st.error("Debe definir una nueva contraseña personal antes de continuar.")
+    current = st.text_input("Contraseña provisoria actual", type="password", key="forced_current_pwd")
+    p1 = st.text_input("Nueva contraseña", type="password", key="forced_new_pwd1")
+    p2 = st.text_input("Repetir nueva contraseña", type="password", key="forced_new_pwd2")
+    if p1:
+        st.caption(f"Fortaleza estimada: {password_strength_label(p1)}")
+    if st.button("Guardar nueva contraseña", type="primary", key="forced_change_pwd"):
+        if p1 != p2:
+            st.error("Las claves no coinciden.")
+        else:
+            ok, msg = change_own_password(user, current, p1)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
 
 
 def admin_password_ui(current_user: dict) -> None:
-    """Panel exclusivo del administrador para crear o redefinir claves.
-    Las claves se guardan hasheadas; no se listan ni se exportan.
-    """
-    st.markdown("<div class='guide'><b>Seguridad:</b> las claves se guardan con hash PBKDF2. Los usuarios comunes no ven este panel y nunca se exporta ninguna contraseña.</div>", unsafe_allow_html=True)
-
+    st.markdown(
+        "<div class='guide'><b>Seguridad:</b> hash scrypt con salt individual, migración automática de hashes antiguos, "
+        "bloqueo por intentos fallidos y auditoría. Las contraseñas nunca se listan ni se exportan.</div>",
+        unsafe_allow_html=True,
+    )
     con = connect()
-    users_df = pd.read_sql_query("SELECT username, full_name, role, active FROM users ORDER BY username", con)
+    users_df = pd.read_sql_query("SELECT username,full_name,matricula,provincia,role,active,last_login_at,locked_until FROM users ORDER BY username", con)
     con.close()
     all_users = users_df["username"].tolist() if not users_df.empty else []
     admin_users = users_df.loc[users_df["role"].eq("admin"), "username"].tolist() if not users_df.empty else []
     default_admin = current_user.get("username", "") if current_user.get("username", "") in all_users else (admin_users[0] if admin_users else "")
 
-    st.subheader("Clave de administrador")
-    tgen, tmanual, tnew = st.tabs(["Generar clave segura", "Definir clave manual", "Crear/convertir administrador"])
-
+    tgen, tmanual, tuser, tadmin = st.tabs([
+        "Generar clave admin", "Definir clave admin", "Crear/restablecer usuario", "Crear/convertir admin"
+    ])
     with tgen:
-        target = st.selectbox("Administrador a modificar", admin_users or [default_admin], index=0, key="admin_pwd_target_generate")
-        length = st.slider("Longitud", 12, 28, 16, 1, key="admin_pwd_len")
-        st.caption("La clave se mostrará una sola vez en esta pantalla del administrador. Guárdela en un gestor de claves.")
+        target = st.selectbox("Administrador a modificar", admin_users or [default_admin], key="admin_pwd_target_generate")
+        length = st.slider("Longitud", 16, 32, 20, 1, key="admin_pwd_len")
         if st.button("Generar nueva clave de administrador", type="primary", key="btn_generate_admin_pwd"):
             new_pass = generate_password(int(length))
             ok, msg = set_user_password(target, new_pass)
             if ok:
                 st.success(msg)
+                st.warning("Copie la clave ahora: se muestra una sola vez.")
                 st.code(new_pass, language=None)
-                st.session_state["admin_password_shown_once_at"] = now_iso()
             else:
                 st.error(msg)
 
     with tmanual:
-        target2 = st.selectbox("Usuario administrador", admin_users or [default_admin], index=0, key="admin_pwd_target_manual")
+        target2 = st.selectbox("Administrador", admin_users or [default_admin], key="admin_pwd_target_manual")
         p1 = st.text_input("Nueva clave", type="password", key="admin_pwd_manual_1")
         p2 = st.text_input("Repetir nueva clave", type="password", key="admin_pwd_manual_2")
+        if p1:
+            st.caption(f"Fortaleza estimada: {password_strength_label(p1)}")
         if st.button("Guardar clave manual", type="primary", key="btn_manual_admin_pwd"):
             if p1 != p2:
                 st.error("Las claves no coinciden.")
@@ -533,133 +923,157 @@ def admin_password_ui(current_user: dict) -> None:
                 ok, msg = set_user_password(target2, p1)
                 st.success(msg) if ok else st.error(msg)
 
-    with tnew:
-        c1, c2 = st.columns(2)
-        with c1:
-            new_admin = st.text_input("Usuario a crear o convertir en administrador", key="new_admin_user")
-            new_admin_name = st.text_input("Nombre visible", value="Administrador", key="new_admin_name")
-        with c2:
-            create_mode = st.radio("Clave", ["Generar automática", "Escribir manual"], horizontal=True, key="new_admin_mode")
-            manual_admin_pass = ""
-            manual_admin_pass_2 = ""
-            if create_mode == "Escribir manual":
-                manual_admin_pass = st.text_input("Clave", type="password", key="new_admin_pass_1")
-                manual_admin_pass_2 = st.text_input("Repetir clave", type="password", key="new_admin_pass_2")
-        if st.button("Crear/actualizar administrador", type="primary", key="btn_create_admin"):
-            if create_mode == "Generar automática":
-                new_pass = generate_password(16)
-            else:
-                if manual_admin_pass != manual_admin_pass_2:
+    with tuser:
+        mode = st.radio("Acción", ["Crear usuario", "Restablecer contraseña"], horizontal=True, key="user_admin_action")
+        if mode == "Crear usuario":
+            c1, c2 = st.columns(2)
+            with c1:
+                u = st.text_input("Nuevo usuario", key="admin_new_user")
+                name = st.text_input("Nombre del operador", key="admin_new_user_name")
+                mat = st.text_input("Matrícula", key="admin_new_user_mat")
+                prov = st.text_input("Provincia", value="Buenos Aires", key="admin_new_user_prov")
+            with c2:
+                auto = st.checkbox("Generar contraseña provisoria", value=True, key="admin_new_user_auto_pwd")
+                p1u = "" if auto else st.text_input("Contraseña provisoria", type="password", key="admin_new_user_pwd1")
+                p2u = "" if auto else st.text_input("Repetir contraseña", type="password", key="admin_new_user_pwd2")
+            if st.button("Crear usuario", type="primary", key="admin_create_user"):
+                pwd = generate_password(20) if auto else p1u
+                if not auto and p1u != p2u:
                     st.error("Las claves no coinciden.")
-                    new_pass = ""
                 else:
-                    new_pass = manual_admin_pass
-            if new_pass:
-                ok, msg = create_admin_user(new_admin, new_pass, new_admin_name)
+                    ok, msg = create_user(u, pwd, name, mat, prov, must_change_password=1)
+                    if ok:
+                        st.success(msg)
+                        st.warning("El usuario deberá cambiar esta contraseña en el primer ingreso.")
+                        if auto:
+                            st.code(pwd, language=None)
+                    else:
+                        st.error(msg)
+        else:
+            regular = users_df.loc[users_df["role"].eq("user"), "username"].tolist() if not users_df.empty else []
+            target_u = st.selectbox("Usuario", regular or all_users, key="admin_reset_user_select")
+            auto_reset = st.checkbox("Generar contraseña provisoria", value=True, key="admin_reset_auto")
+            rp1 = "" if auto_reset else st.text_input("Nueva contraseña provisoria", type="password", key="admin_reset_pwd1")
+            rp2 = "" if auto_reset else st.text_input("Repetir contraseña", type="password", key="admin_reset_pwd2")
+            if st.button("Restablecer contraseña", type="primary", key="admin_reset_user_pwd"):
+                pwd = generate_password(20) if auto_reset else rp1
+                if not auto_reset and rp1 != rp2:
+                    st.error("Las claves no coinciden.")
+                else:
+                    ok, msg = set_user_password(target_u, pwd, force_change=True)
+                    if ok:
+                        st.success(msg)
+                        st.warning("El usuario deberá cambiarla al ingresar.")
+                        if auto_reset:
+                            st.code(pwd, language=None)
+                    else:
+                        st.error(msg)
+
+    with tadmin:
+        new_admin = st.text_input("Usuario a crear o convertir", key="new_admin_user")
+        new_admin_name = st.text_input("Nombre visible", value="Administrador", key="new_admin_name")
+        auto_admin = st.checkbox("Generar clave automática", value=True, key="new_admin_auto")
+        ap1 = "" if auto_admin else st.text_input("Clave", type="password", key="new_admin_pass_1")
+        ap2 = "" if auto_admin else st.text_input("Repetir clave", type="password", key="new_admin_pass_2")
+        if st.button("Crear/actualizar administrador", type="primary", key="btn_create_admin"):
+            pwd = generate_password(22) if auto_admin else ap1
+            if not auto_admin and ap1 != ap2:
+                st.error("Las claves no coinciden.")
+            else:
+                ok, msg = create_admin_user(new_admin, pwd, new_admin_name)
                 if ok:
                     st.success(msg)
-                    if create_mode == "Generar automática":
-                        st.code(new_pass, language=None)
+                    if auto_admin:
+                        st.code(pwd, language=None)
                 else:
                     st.error(msg)
 
-    st.markdown("#### Roles de usuarios")
-    with st.container():
-        if all_users:
-            u = st.selectbox("Usuario", all_users, key="role_user_select")
-            selected = users_df[users_df["username"].eq(u)].iloc[0]
-            role = st.selectbox("Rol", ["user", "admin"], index=1 if selected["role"] == "admin" else 0, key="role_select")
-            active = st.checkbox("Usuario activo", value=bool(selected["active"]), key="role_active")
-            if st.button("Actualizar rol/estado", key="btn_update_role"):
-                ok, msg = set_user_role(u, role, 1 if active else 0)
-                st.success(msg) if ok else st.error(msg)
-                if u == current_user.get("username"):
-                    st.session_state.user["role"] = role
+    st.markdown("#### Roles, estado y bloqueos")
+    if all_users:
+        u = st.selectbox("Usuario", all_users, key="role_user_select")
+        selected = users_df[users_df["username"].eq(u)].iloc[0]
+        role = st.selectbox("Rol", ["user", "admin"], index=1 if selected["role"] == "admin" else 0, key="role_select")
+        active = st.checkbox("Usuario activo", value=bool(selected["active"]), key="role_active")
+        st.caption(f"Último ingreso: {selected.get('last_login_at') or '—'} · Bloqueado hasta: {selected.get('locked_until') or '—'}")
+        if st.button("Actualizar rol/estado", key="btn_update_role"):
+            ok, msg = set_user_role(u, role, 1 if active else 0)
+            st.success(msg) if ok else st.error(msg)
+            if ok and u == current_user.get("username"):
+                st.session_state.user = dict(get_user(u))
 
 
 def login_ui() -> None:
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='guide'><b>Ingreso protegido.</b> Cada operador queda identificado para el análisis de correlación y concordancia interusuario. Los Excel exportan código anónimo, no nombre del paciente.</div>", unsafe_allow_html=True)
-    t1, t2 = st.tabs(["Ingresar", "Registrar usuario"])
+    st.markdown(
+        "<div class='guide'><b>Ingreso protegido.</b> Claves con hash robusto, bloqueo temporal tras intentos fallidos y sesiones con vencimiento. "
+        "Los Excel exportan código anónimo, no nombre del paciente.</div>", unsafe_allow_html=True
+    )
+    t1, t2 = st.tabs(["Ingresar", "Registro de usuario"])
     with t1:
         c1, c2 = st.columns(2)
         with c1:
-            username = st.text_input("Usuario")
-            password = st.text_input("Contraseña", type="password")
-            if st.button("Ingresar", type="primary"):
-                row = get_user(username)
-                if row and row["active"] and verify_password(password, row["password_hash"]):
-                    st.session_state.user = dict(row)
+            username = st.text_input("Usuario", key="login_username")
+            password = st.text_input("Contraseña", type="password", key="login_password")
+            if st.button("Ingresar", type="primary", key="login_button"):
+                ok, msg, user = authenticate_user(username, password)
+                if ok and user:
+                    start_authenticated_session(user)
                     st.rerun()
                 else:
-                    st.error("Usuario o contraseña incorrectos.")
+                    st.error(msg)
         with c2:
-            st.markdown(
-                "<div class='guide'><b>Acceso de administrador.</b> "
-                "Las credenciales se configuran en Secrets o variables de entorno y nunca se muestran en pantalla.</div>",
-                unsafe_allow_html=True,
-            )
             if not admin_exists():
-                with st.expander("Crear administrador inicial", expanded=True):
-                    setup_token_cfg = get_secret_value("CGI_SETUP_TOKEN", "")
-                    if setup_token_cfg:
-                        st.caption("Instalación protegida: ingrese el token definido en Secrets como CGI_SETUP_TOKEN. Acepta CREAR-ADMIN o CREAR ADMIN.")
-                        setup_token = st.text_input("Token de instalación", type="password", key="setup_token")
-                    else:
-                        setup_token = ""
-                        st.info("No hay administrador creado. Cree el administrador inicial. No necesita escribir token.")
-
-                    admin_user_init = st.text_input("Usuario administrador inicial", value=get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT), key="setup_admin_user")
-                    admin_pass_mode = st.radio("Clave inicial", ["Generar automática", "Escribir manual"], horizontal=True, key="setup_admin_mode")
-                    init_pass = ""
-                    init_pass_2 = ""
-                    if admin_pass_mode == "Escribir manual":
-                        init_pass = st.text_input("Clave administrador", type="password", key="setup_admin_pass1")
-                        init_pass_2 = st.text_input("Repetir clave", type="password", key="setup_admin_pass2")
-
+                st.markdown("#### Crear administrador inicial")
+                setup_token_cfg = get_secret_value("CGI_SETUP_TOKEN", "")
+                if not setup_token_cfg or len(normalize_setup_token(setup_token_cfg)) < 12:
+                    st.error("Alta inicial cerrada. Configure CGI_SETUP_TOKEN (mínimo 12 caracteres) o CGI_ADMIN_PASS en Streamlit Secrets.")
+                else:
+                    setup_token = st.text_input("Token de instalación", type="password", key="setup_token")
+                    admin_user_init = st.text_input("Usuario administrador", value=get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT), key="setup_admin_user")
+                    auto = st.checkbox("Generar clave segura", value=True, key="setup_admin_auto")
+                    ip1 = "" if auto else st.text_input("Clave administrador", type="password", key="setup_admin_pass1")
+                    ip2 = "" if auto else st.text_input("Repetir clave", type="password", key="setup_admin_pass2")
                     if st.button("Crear administrador inicial", type="primary", key="btn_setup_admin"):
                         if not setup_token_ok(setup_token, setup_token_cfg):
-                            st.error("Token de instalación incorrecto. Escriba exactamente CREAR-ADMIN o CREAR ADMIN, según lo configurado en Secrets.")
+                            st.error("Token de instalación incorrecto.")
+                        elif not auto and ip1 != ip2:
+                            st.error("Las claves no coinciden.")
                         else:
-                            if admin_pass_mode == "Generar automática":
-                                new_admin_pass = generate_password(16)
+                            pwd = generate_password(22) if auto else ip1
+                            ok, msg = create_admin_user(admin_user_init, pwd, "Administrador")
+                            if ok:
+                                st.success(msg)
+                                if auto:
+                                    st.warning("Copie esta clave ahora. No volverá a mostrarse.")
+                                    st.code(pwd, language=None)
                             else:
-                                if len(init_pass) < 8:
-                                    st.error("La clave de administrador debe tener al menos 8 caracteres.")
-                                    new_admin_pass = ""
-                                elif init_pass != init_pass_2:
-                                    st.error("Las claves no coinciden.")
-                                    new_admin_pass = ""
-                                else:
-                                    new_admin_pass = init_pass
-                            if new_admin_pass:
-                                ok, msg = create_admin_user(admin_user_init, new_admin_pass, "Administrador")
-                                if ok:
-                                    st.success(msg)
-                                    if admin_pass_mode == "Generar automática":
-                                        st.warning("Copie esta clave ahora. Por seguridad no se volverá a mostrar.")
-                                        st.code(new_admin_pass, language=None)
-                                    st.session_state.user = dict(get_user(admin_user_init))
-                                    st.info("Administrador creado. Ahora toque cualquier control o recargue la página para entrar al panel administrador.")
-                                    st.stop()
-                                else:
-                                    st.error(msg)
-    with t2:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            new_user = st.text_input("Nuevo usuario")
-            new_pass = st.text_input("Nueva contraseña", type="password")
-        with c2:
-            full_name = st.text_input("Nombre del operador")
-            matricula = st.text_input("Matrícula profesional")
-        with c3:
-            provincia = st.selectbox("Provincia", ["", "Buenos Aires", "CABA", "Catamarca", "Chaco", "Chubut", "Córdoba", "Corrientes", "Entre Ríos", "Formosa", "Jujuy", "La Pampa", "La Rioja", "Mendoza", "Misiones", "Neuquén", "Río Negro", "Salta", "San Juan", "San Luis", "Santa Cruz", "Santa Fe", "Santiago del Estero", "Tierra del Fuego", "Tucumán"])
-        if st.button("Registrar"):
-            ok, msg = create_user(new_user, new_pass, full_name, matricula, provincia)
-            if ok:
-                st.success(msg)
+                                st.error(msg)
             else:
-                st.error(msg)
+                st.info("Las altas, restablecimientos y cambios de rol se administran desde el panel protegido del administrador.")
+
+    with t2:
+        if not allow_self_registration():
+            st.info("El registro público está desactivado. Solicite el alta al administrador.")
+        else:
+            token = st.text_input("Token de registro", type="password", key="registration_token")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                new_user = st.text_input("Nuevo usuario", key="register_user")
+                new_pass = st.text_input("Nueva contraseña", type="password", key="register_password")
+                if new_pass:
+                    st.caption(f"Fortaleza estimada: {password_strength_label(new_pass)}")
+            with c2:
+                full_name = st.text_input("Nombre del operador", key="register_name")
+                matricula = st.text_input("Matrícula profesional", key="register_matricula")
+            with c3:
+                provincia = st.selectbox("Provincia", ["", "Buenos Aires", "CABA", "Catamarca", "Chaco", "Chubut", "Córdoba", "Corrientes", "Entre Ríos", "Formosa", "Jujuy", "La Pampa", "La Rioja", "Mendoza", "Misiones", "Neuquén", "Río Negro", "Salta", "San Juan", "San Luis", "Santa Cruz", "Santa Fe", "Santiago del Estero", "Tierra del Fuego", "Tucumán"], key="register_province")
+            if st.button("Registrar", key="register_button"):
+                if not registration_token_ok(token):
+                    st.error("Token de registro inválido.")
+                else:
+                    ok, msg = create_user(new_user, new_pass, full_name, matricula, provincia)
+                    st.success(msg) if ok else st.error(msg)
+
 
 # ============================================================
 # PDF / IMAGEN / TEXTO
@@ -2967,108 +3381,165 @@ def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
 
 
 def generate_automatic_backup(force: bool = False) -> dict:
-    """Genera cada 72 h un Excel global y una copia completa de SQLite.
+    """Genera un corte histórico semanal de SQLite + Excel + manifiesto SHA-256."""
+    with BACKUP_LOCK:
+        if not force and not backup_due():
+            return read_backup_state()
 
-    El Excel no incluye contraseñas. La copia SQLite sí conserva usuarios,
-    roles y hashes PBKDF2 necesarios para restaurar el acceso.
-    """
-    if not force and not backup_due():
-        return read_backup_state()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    db_file = BACKUP_DIR / f"cgi_base_completa_{stamp}.sqlite3"
-    xlsx_file = BACKUP_DIR / f"cgi_todos_los_estudios_{stamp}.xlsx"
-    create_sqlite_snapshot(db_file)
-    xlsx_file.write_bytes(export_excel({}, only_current_user=False))
+        created_at = now_iso()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_file = BACKUP_DIR / f"cgi_base_completa_{stamp}.sqlite3"
+        xlsx_file = BACKUP_DIR / f"cgi_todos_los_estudios_{stamp}.xlsx"
+        manifest_file = BACKUP_DIR / f"cgi_respaldo_{stamp}.json"
 
-    # Alias estables para descarga y restauración.
-    latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
-    latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
-    shutil.copy2(db_file, latest_db)
-    shutil.copy2(xlsx_file, latest_xlsx)
+        create_sqlite_snapshot(db_file)
+        atomic_write_bytes(xlsx_file, export_excel({}, only_current_user=False))
+        validate_excel_file(xlsx_file)
+        integrity = database_integrity_summary(db_file)
+        if not integrity.get("ok"):
+            raise RuntimeError(f"La base semanal no superó integridad: {integrity.get('error','sin detalle')}")
 
-    remote_ok = False
-    remote_error = ""
-    if _s3_configured():
-        try:
-            prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
-            _upload_backup_to_s3(db_file, f"{prefix}/historico/{db_file.name}")
-            _upload_backup_to_s3(xlsx_file, f"{prefix}/historico/{xlsx_file.name}")
-            _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
-            _upload_backup_to_s3(latest_xlsx, f"{prefix}/latest/cgi_todos_los_estudios.xlsx")
-            remote_ok = True
-        except Exception as exc:
-            remote_error = str(exc)
+        manifest = {
+            "created_at": created_at,
+            "database": {"name": db_file.name, "sha256": sha256_file(db_file), "bytes": db_file.stat().st_size},
+            "excel": {"name": xlsx_file.name, "sha256": sha256_file(xlsx_file), "bytes": xlsx_file.stat().st_size},
+            "counts": {
+                "users": int(integrity.get("users", 0)),
+                "admins": int(integrity.get("admins", 0)),
+                "studies": int(integrity.get("studies", 0)),
+            },
+        }
+        atomic_write_bytes(manifest_file, json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
 
-    state = {
-        "created_at": now_iso(),
-        "next_due_at": (datetime.now() + timedelta(hours=BACKUP_INTERVAL_HOURS)).isoformat(timespec="seconds"),
-        "database_file": str(latest_db),
-        "excel_file": str(latest_xlsx),
-        "remote_configured": _s3_configured(),
-        "remote_ok": remote_ok,
-        "remote_error": remote_error,
-    }
-    write_backup_state(state)
+        latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+        latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        latest_manifest = BACKUP_DIR / "cgi_respaldo_ultimo.json"
+        shutil.copy2(db_file, latest_db)
+        shutil.copy2(xlsx_file, latest_xlsx)
+        shutil.copy2(manifest_file, latest_manifest)
 
-    # Rotación local: conserva los 10 respaldos más recientes de cada tipo.
-    for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx"):
-        old = sorted(BACKUP_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)[10:]
-        for f in old:
+        remote_ok = False
+        remote_error = ""
+        if _s3_configured():
             try:
-                f.unlink()
-            except Exception:
-                pass
-    return state
+                prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
+                historical = f"{prefix}/historico/{datetime.now().strftime('%Y/%m')}"
+                _upload_backup_to_s3(db_file, f"{historical}/{db_file.name}")
+                _upload_backup_to_s3(xlsx_file, f"{historical}/{xlsx_file.name}")
+                _upload_backup_to_s3(manifest_file, f"{historical}/{manifest_file.name}")
+                _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
+                _upload_backup_to_s3(latest_xlsx, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
+                _upload_backup_to_s3(latest_manifest, f"{prefix}/latest/cgi_respaldo_manifest.json")
+                remote_ok = True
+            except Exception as exc:
+                remote_error = str(exc)
+
+        next_due = (datetime.now() + timedelta(hours=BACKUP_INTERVAL_HOURS)).isoformat(timespec="seconds")
+        state = {
+            "created_at": created_at,
+            "next_due_at": next_due,
+            "database_file": str(latest_db),
+            "excel_file": str(latest_xlsx),
+            "manifest_file": str(latest_manifest),
+            "database_sha256": manifest["database"]["sha256"],
+            "excel_sha256": manifest["excel"]["sha256"],
+            "remote_configured": _s3_configured(),
+            "remote_ok": remote_ok,
+            "remote_error": remote_error,
+        }
+        write_backup_state(state)
+        set_system_state("last_weekly_backup_at", created_at)
+        set_system_state("last_weekly_backup_status", "remote_ok" if remote_ok else ("local_only" if not _s3_configured() else "remote_error"))
+
+        # Conserva hasta 52 cortes semanales locales de cada tipo.
+        for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx", "cgi_respaldo_*.json"):
+            old = sorted(BACKUP_DIR.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
+            for file in old:
+                try:
+                    file.unlink()
+                except Exception:
+                    pass
+        return state
 
 
 def backup_admin_panel() -> None:
-    st.markdown("#### Respaldo automático cada 72 horas")
+    st.markdown("#### Repositorio persistente y respaldo semanal")
     integrity = database_integrity_summary()
     if integrity.get("ok"):
-        st.success(f"Base íntegra: {integrity.get('users',0)} usuarios, {integrity.get('admins',0)} administrador/es y {integrity.get('studies',0)} estudios.")
+        st.success(
+            f"Base íntegra: {integrity.get('users',0)} usuarios, "
+            f"{integrity.get('admins',0)} administrador/es y {integrity.get('studies',0)} estudios."
+        )
     else:
         st.error(f"Control de integridad fallido: {integrity.get('error','sin detalle')}")
+
     state = read_backup_state()
     if state:
-        st.info(f"Último respaldo: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
+        st.info(f"Último corte semanal: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
+        st.caption(f"SHA-256 Excel: {state.get('excel_sha256','—')} · SHA-256 DB: {state.get('database_sha256','—')}")
     else:
-        st.warning("Todavía no se generó el primer respaldo automático.")
+        st.warning("Todavía no se generó el primer corte semanal.")
+
+    last_persist = get_system_state("last_persist_at", "")
+    last_error = get_system_state("last_persist_error", "")
+    if last_persist:
+        st.caption(f"Última sincronización estable posterior a una escritura: {last_persist}")
+    if last_error:
+        st.warning(f"Último error de persistencia registrado: {last_error}")
+
     if _s3_configured():
         if state.get("remote_ok"):
-            st.success("Respaldo remoto cifrado en S3 activo.")
+            st.success("Persistencia remota S3 activa: copia estable tras cambios y corte histórico semanal versionado.")
         else:
-            st.warning(f"S3 configurado, pero el último envío no se confirmó: {state.get('remote_error','sin detalle')}")
+            st.warning(f"S3 está configurado, pero el último corte no confirmó la subida: {state.get('remote_error','sin detalle')}")
     else:
-        st.warning("El respaldo local no sobrevive necesariamente a un redeploy de Streamlit Cloud. Configure CGI_S3_BUCKET y credenciales AWS/S3 para persistencia real.")
+        st.error(
+            "Persistencia remota no configurada. El Excel local puede perderse en un reinicio o redeploy. "
+            "Configure CGI_S3_BUCKET y credenciales S3 para garantizar continuidad."
+        )
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Generar respaldo ahora", key="force_backup_now"):
+        if st.button("Generar corte semanal ahora", key="force_backup_now"):
             try:
                 state = generate_automatic_backup(force=True)
-                st.success(f"Respaldo creado: {state.get('created_at','')}")
+                st.success(f"Respaldo validado: {state.get('created_at','')}")
+                st.rerun()
             except Exception as exc:
                 st.error(f"No se pudo generar el respaldo: {exc}")
     latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
     latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+    latest_manifest = BACKUP_DIR / "cgi_respaldo_ultimo.json"
     with c2:
         if latest_xlsx.exists():
             st.download_button(
-                "Descargar último Excel automático",
+                "Descargar Excel semanal más reciente",
                 data=latest_xlsx.read_bytes(),
-                file_name="cgi_todos_los_estudios_ultimo.xlsx",
+                file_name=f"cgi_repositorio_semanal_{date.today().isoformat()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_latest_auto_excel",
             )
     if latest_db.exists():
         st.download_button(
-            "Descargar copia completa de seguridad (usuarios + estudios)",
+            "Descargar copia completa (usuarios + estudios)",
             data=latest_db.read_bytes(),
-            file_name="cgi_repositorio_respaldo.sqlite3",
+            file_name=f"cgi_repositorio_seguridad_{date.today().isoformat()}.sqlite3",
             mime="application/octet-stream",
             key="download_latest_db_backup",
         )
-        st.caption("Esta copia contiene hashes de contraseña, no contraseñas legibles. Debe guardarse en un lugar seguro y solo estar disponible para el administrador.")
+    if latest_manifest.exists():
+        st.download_button(
+            "Descargar manifiesto de integridad",
+            data=latest_manifest.read_bytes(),
+            file_name=f"cgi_respaldo_manifest_{date.today().isoformat()}.json",
+            mime="application/json",
+            key="download_latest_manifest",
+        )
+    st.caption(
+        "La app genera y conserva el archivo semanal automáticamente. La descarga al disco de la computadora requiere pulsar el botón, "
+        "porque los navegadores bloquean descargas automáticas sin interacción del usuario."
+    )
+
 
 # ============================================================
 # INTERFAZ
@@ -3091,28 +3562,60 @@ def app_main() -> None:
     if not integrity.get("ok"):
         st.error(f"La base no superó el control de integridad: {integrity.get('error','sin detalle')}")
         st.stop()
+    excel_restored, excel_restore_msg = restore_latest_excel_from_remote_if_missing()
     try:
         generate_automatic_backup(force=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        set_system_state("last_weekly_backup_error", str(exc)[:500])
     if migrated and migration_msg:
         st.success(migration_msg)
     if restored and restore_msg:
         st.success(restore_msg)
+    if excel_restored and excel_restore_msg:
+        st.success(excel_restore_msg)
     if "user" not in st.session_state:
         login_ui()
         return
+    if not enforce_session_security():
+        login_ui()
+        return
+    refreshed = get_user(st.session_state.user.get("username", ""))
+    if not refreshed or not int(refreshed["active"]):
+        st.session_state.clear()
+        st.error("La cuenta ya no está activa. Ingrese con otra credencial.")
+        login_ui()
+        return
+    st.session_state.user = dict(refreshed)
     user = st.session_state.user
+    if int(user.get("must_change_password", 0)):
+        st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>Actualización obligatoria de credenciales</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
+        forced_password_change_ui(user)
+        return
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         st.markdown(f"<div class='ok'><b>Operador:</b> {user['username']} | <b>Rol:</b> {user['role']} | <b>Objetivo:</b> repositorio anónimo para concordancia interusuario.</div>", unsafe_allow_html=True)
     with c2:
         if st.button("Cerrar sesión"):
-            st.session_state.pop("user", None)
+            audit_auth_event(user.get("username", ""), "logout", "Cierre manual")
+            for key in ["user", "auth_login_at", "auth_last_activity", "auth_session_nonce"]:
+                st.session_state.pop(key, None)
             st.rerun()
     with c3:
         st.caption("Los nombres de pacientes y el nombre del archivo original no se exportan.")
+
+    with st.expander("Cambiar mi contraseña", expanded=False):
+        current_pwd = st.text_input("Contraseña actual", type="password", key="own_pwd_current")
+        own_p1 = st.text_input("Nueva contraseña", type="password", key="own_pwd_new1")
+        own_p2 = st.text_input("Repetir nueva contraseña", type="password", key="own_pwd_new2")
+        if own_p1:
+            st.caption(f"Fortaleza estimada: {password_strength_label(own_p1)}")
+        if st.button("Actualizar mi contraseña", key="own_pwd_change_button"):
+            if own_p1 != own_p2:
+                st.error("Las claves no coinciden.")
+            else:
+                ok, msg = change_own_password(user, current_pwd, own_p1)
+                st.success(msg) if ok else st.error(msg)
 
     # Navegación exclusiva: a diferencia de st.tabs, sólo ejecuta la sección
     # visible. Esto evita montar componentes/iframes ocultos y previene el
@@ -3317,9 +3820,17 @@ def app_main() -> None:
             with st.container():
                 admin_password_ui(user)
             con = connect()
-            udf = pd.read_sql_query("SELECT id,username,full_name,matricula,provincia,role,active,created_at FROM users ORDER BY created_at DESC", con)
+            udf = pd.read_sql_query(
+                "SELECT id,username,full_name,matricula,provincia,role,active,created_at,last_login_at,password_changed_at,failed_attempts,locked_until,must_change_password "
+                "FROM users ORDER BY created_at DESC", con
+            )
+            audit_df = pd.read_sql_query(
+                "SELECT created_at,username,event_type,detail FROM auth_audit ORDER BY id DESC LIMIT 500", con
+            )
             con.close()
             st.dataframe(udf, use_container_width=True)
+            with st.expander("Auditoría de accesos (últimos 500 eventos)", expanded=False):
+                st.dataframe(audit_df, use_container_width=True)
             all_df = studies_df(None)
             all_wide = studies_wide_df(None)
             st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
