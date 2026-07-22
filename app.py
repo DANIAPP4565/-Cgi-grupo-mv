@@ -37,7 +37,7 @@ except Exception:
     fitz = None
 
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
-APP_BUILD = "CGI-ROBUST-S3-V4-20260720"
+APP_BUILD = "CGI-ROBUST-S3-V5-FRESHINIT-20260722"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
 
@@ -64,6 +64,12 @@ FILES_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_INTERVAL_HOURS = 24 * 7  # respaldo histórico semanal
 BACKUP_RETENTION_COUNT = 52     # conserva hasta un año de cortes semanales
+
+# Instalación inicial confirmada sin usuarios ni estudios previos.
+# Permite crear una base SQLite vacía aunque S3 no pueda autenticarse.
+# IMPORTANTE: S3 sigue siendo recomendable antes de cargar datos definitivos,
+# porque el disco local de Streamlit Cloud puede ser efímero tras un redeploy.
+FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = True
 BACKUP_LOCK = threading.RLock()
 PASSWORD_MIN_LENGTH = 12
 ADMIN_PASSWORD_MIN_LENGTH = 14
@@ -3829,51 +3835,54 @@ def app_main() -> None:
     migrated, migration_msg = migrate_legacy_local_database()
     restored = False
     restore_msg = ""
+    fresh_empty_bootstrap_used = False
+    fresh_empty_bootstrap_reason = ""
+
     if not DB_PATH.exists():
         cfg = s3_configuration_status()
 
-        # Nunca tratamos textos de ejemplo como una configuración S3 real.
-        # Tampoco creamos silenciosamente una base vacía cuando falta la base local.
+        # Esta versión corresponde a una instalación inicial confirmada sin
+        # usuarios ni estudios. Por ese motivo, un problema de S3 NO bloquea
+        # la creación de la primera base local vacía.
         if cfg.get("invalid"):
-            st.error("Configuración de persistencia incompleta: se detectaron valores de ejemplo en Streamlit Secrets.")
-            for problem in cfg.get("invalid", []):
-                st.warning(problem)
-            st.code(
-                'CGI_S3_BUCKET = "nombre-real-del-bucket"\n'
-                'AWS_DEFAULT_REGION = "region-real"\n'
-                'CGI_S3_DB_KEY = "cgi-backups/latest/cgi_repositorio.sqlite3"\n'
-                'CGI_ALLOW_EMPTY_INIT = false'
-            )
-            st.info(
-                "No escriba literalmente textos de ejemplo como NOMBRE-EXACTO-DEL-BUCKET, REGION-REAL-DEL-BUCKET, "
-                "AQUI-VA-EL-NOMBRE-REAL-DE-TU-BUCKET o AQUI-VA-LA-REGION-REAL. "
-                "Si la app ya tenía usuarios o estudios, mantenga CGI_ALLOW_EMPTY_INIT=false."
-            )
-            st.stop()
-
-        if cfg.get("configured"):
-            restored, restore_msg = restore_database_from_remote_if_missing()
-            if not restored and not allow_empty_remote_initialization():
-                st.error("Protección de datos activada: no se creó una base vacía porque el repositorio remoto no pudo validarse/restaurarse.")
-                st.code(restore_msg or "No se pudo recuperar la base remota.")
-                st.caption(
-                    f"Bucket configurado: {cfg.get('bucket') or '—'} · "
-                    f"Key esperada: {get_secret_value('CGI_S3_DB_KEY','cgi-backups/latest/cgi_repositorio.sqlite3')} · "
-                    f"Región: {cfg.get('region') or 'automática/no especificada'}"
+            if FRESH_INSTALL_EMPTY_INIT_AUTHORIZED or allow_empty_remote_initialization():
+                fresh_empty_bootstrap_used = True
+                fresh_empty_bootstrap_reason = (
+                    "La configuración S3 contiene valores incompletos o de ejemplo. "
+                    "Se inició una base local vacía porque esta instalación fue confirmada como nueva."
                 )
-                st.info(
-                    "No active CGI_ALLOW_EMPTY_INIT=true si esta app ya tenía usuarios o estudios. "
-                    "Primero corrija bucket/key/región/permisos."
-                )
+            else:
+                st.error("Configuración de persistencia incompleta: se detectaron valores de ejemplo en Streamlit Secrets.")
+                for problem in cfg.get("invalid", []):
+                    st.warning(problem)
                 st.stop()
+
+        elif cfg.get("configured"):
+            restored, restore_msg = restore_database_from_remote_if_missing()
+            if not restored:
+                if FRESH_INSTALL_EMPTY_INIT_AUTHORIZED or allow_empty_remote_initialization():
+                    fresh_empty_bootstrap_used = True
+                    fresh_empty_bootstrap_reason = (
+                        (restore_msg or "No se pudo validar/restaurar el repositorio S3.") +
+                        " Se creó una base local vacía porque esta instalación fue confirmada sin usuarios ni estudios previos."
+                    )
+                else:
+                    st.error(
+                        "Protección de datos activada: no se creó una base vacía porque el repositorio remoto "
+                        "no pudo validarse/restaurarse."
+                    )
+                    st.code(restore_msg or "No se pudo recuperar la base remota.")
+                    st.stop()
         else:
-            # Sin DB local y sin S3 válido: exige una inicialización explícita.
-            # Esto evita perder visualmente usuarios/estudios tras un redeploy.
-            if not allow_empty_remote_initialization():
-                st.error("Protección de datos activada: no existe una base local y no hay un repositorio remoto S3 válido configurado.")
-                st.info(
-                    "Configure un bucket S3 real para restaurar la base histórica. "
-                    "Solo para una instalación completamente nueva, sin usuarios ni estudios previos, active CGI_ALLOW_EMPTY_INIT=true una sola vez."
+            if FRESH_INSTALL_EMPTY_INIT_AUTHORIZED or allow_empty_remote_initialization():
+                fresh_empty_bootstrap_used = True
+                fresh_empty_bootstrap_reason = (
+                    "No hay una base local ni un repositorio S3 operativo. "
+                    "Se creó una base local vacía porque esta instalación fue confirmada como nueva."
+                )
+            else:
+                st.error(
+                    "Protección de datos activada: no existe una base local y no hay un repositorio remoto S3 válido configurado."
                 )
                 st.stop()
     init_db()
@@ -3881,6 +3890,19 @@ def app_main() -> None:
     if not integrity.get("ok"):
         st.error(f"La base no superó el control de integridad: {integrity.get('error','sin detalle')}")
         st.stop()
+    if fresh_empty_bootstrap_used:
+        try:
+            set_system_state("fresh_empty_bootstrap_at", now_iso())
+            set_system_state("fresh_empty_bootstrap_reason", fresh_empty_bootstrap_reason[:1000])
+        except Exception:
+            pass
+        st.warning(
+            "Instalación inicial habilitada: se creó una base local vacía sin restauración S3. "
+            "Puede crear usuarios y comenzar a probar la aplicación. Antes de cargar datos definitivos, "
+            "corrija las credenciales AWS para asegurar persistencia tras reinicios o redeploys."
+        )
+        if fresh_empty_bootstrap_reason:
+            st.caption(fresh_empty_bootstrap_reason)
     excel_restored, excel_restore_msg = restore_latest_excel_from_remote_if_missing()
     try:
         generate_automatic_backup(force=False)
