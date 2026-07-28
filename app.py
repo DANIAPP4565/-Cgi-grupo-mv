@@ -4548,4 +4548,7 @@ def app_main() -> None:
 if __name__ == "__main__":
     try:
         app_main()
-    except
+    except Exception as exc:
+        css()
+        st.error("La aplicación encontró un error controlado.")
+        st.exception(exc)
