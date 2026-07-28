@@ -63,13 +63,15 @@ BACKUP_DIR = DATA_DIR / "respaldos"
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_INTERVAL_HOURS = 24 * 7  # respaldo histórico semanal
-BACKUP_RETENTION_COUNT = 52     # conserva hasta un año de cortes semanales
+BACKUP_RETENTION_COUNT = 260    # conserva hasta cinco años de cortes semanales
 
 # Instalación inicial confirmada sin usuarios ni estudios previos.
-# Permite crear una base SQLite vacía aunque S3 no pueda autenticarse.
-# IMPORTANTE: S3 sigue siendo recomendable antes de cargar datos definitivos,
-# porque el disco local de Streamlit Cloud puede ser efímero tras un redeploy.
-FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = True
+# Por defecto queda cerrada: crear una base vacía cuando falla S3 puede dejar
+# la app sin usuarios y sobrescribir Excel/respaldos con un repositorio vacío.
+FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = (
+    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "false").strip().lower()
+    in {"1", "true", "yes", "si", "sí"}
+)
 BACKUP_LOCK = threading.RLock()
 PASSWORD_MIN_LENGTH = 12
 ADMIN_PASSWORD_MIN_LENGTH = 14
@@ -534,6 +536,45 @@ def restore_database_from_remote_if_missing() -> tuple[bool, str]:
         return False, f"No se pudo descargar/restaurar la base remota{suffix}: {exc}"
 
 
+def restore_database_from_local_backup_if_missing() -> tuple[bool, str]:
+    """Recupera la DB desde respaldos locales antes de permitir una base vacía."""
+    if DB_PATH.exists():
+        return False, ""
+    candidates = []
+    latest = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+    if latest.exists():
+        candidates.append(latest)
+    try:
+        candidates.extend(
+            sorted(
+                BACKUP_DIR.glob("cgi_base_completa_*.sqlite3"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    except Exception:
+        pass
+
+    errors = []
+    for candidate in candidates:
+        try:
+            check = database_integrity_summary(candidate)
+            if not check.get("ok"):
+                errors.append(f"{candidate.name}: {check.get('error','integridad inválida')}")
+                continue
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(candidate, DB_PATH)
+            return True, (
+                f"Base recuperada desde respaldo local {candidate.name}: "
+                f"{check.get('users',0)} usuarios y {check.get('studies',0)} estudios."
+            )
+        except Exception as exc:
+            errors.append(f"{candidate.name}: {exc}")
+    if errors:
+        return False, "No se pudo recuperar la base local. " + " | ".join(errors[:3])
+    return False, ""
+
+
 def restore_latest_excel_from_remote_if_missing() -> tuple[bool, str]:
     """Recupera el Excel estable para que siga disponible tras un redeploy."""
     latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
@@ -555,6 +596,39 @@ def restore_latest_excel_from_remote_if_missing() -> tuple[bool, str]:
         except Exception:
             pass
         return False, f"No se pudo recuperar el Excel remoto: {exc}"
+
+
+def ensure_latest_excel_available() -> tuple[bool, str]:
+    """Asegura un Excel estable local sin depender de descargas del navegador."""
+    latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    if latest.exists():
+        try:
+            validate_excel_file(latest)
+            return False, ""
+        except Exception:
+            corrupt = latest.with_suffix(latest.suffix + f".corrupto_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            try:
+                latest.replace(corrupt)
+            except Exception:
+                pass
+
+    if not DB_PATH.exists():
+        return False, ""
+    integrity = database_integrity_summary()
+    if not integrity.get("ok"):
+        return False, f"No se regeneró el Excel porque la base no está íntegra: {integrity.get('error','sin detalle')}"
+    excel_builder = globals().get("export_excel")
+    if not callable(excel_builder):
+        return False, ""
+    try:
+        atomic_write_bytes(latest, excel_builder({}, only_current_user=False))
+        validate_excel_file(latest)
+        if _s3_configured():
+            prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
+            _upload_backup_to_s3(latest, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
+        return True, f"Excel estable regenerado desde la base local: {integrity.get('studies',0)} estudios."
+    except Exception as exc:
+        return False, f"No se pudo regenerar el Excel estable: {exc}"
 
 
 def database_integrity_summary(path: Path | None = None) -> dict:
@@ -734,11 +808,28 @@ def preserve_database_after_write(reason: str = "actualizacion") -> None:
         with BACKUP_LOCK:
             latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
             latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+            integrity = database_integrity_summary()
+            previous_integrity = database_integrity_summary(latest_db) if latest_db.exists() else {}
+            if (
+                int(integrity.get("studies", 0) or 0) == 0
+                and int(previous_integrity.get("studies", 0) or 0) > 0
+            ):
+                set_system_state(
+                    "last_persist_error",
+                    "Se evitó sobrescribir un respaldo con estudios usando una base actual sin estudios.",
+                )
+                return
             create_sqlite_snapshot(latest_db)
             excel_builder = globals().get("export_excel")
             if callable(excel_builder):
-                atomic_write_bytes(latest_xlsx, excel_builder({}, only_current_user=False))
-                validate_excel_file(latest_xlsx)
+                if int(integrity.get("studies", 0) or 0) == 0 and latest_xlsx.exists():
+                    set_system_state(
+                        "last_persist_warning",
+                        "Se evitó sobrescribir el Excel estable con una exportación sin estudios.",
+                    )
+                else:
+                    atomic_write_bytes(latest_xlsx, excel_builder({}, only_current_user=False))
+                    validate_excel_file(latest_xlsx)
             if _s3_configured():
                 prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
                 _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
@@ -866,17 +957,24 @@ def init_db() -> None:
         pass
     con.commit()
 
-    n = int(cur.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"])
     admin_created = False
+    active_admins = int(cur.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND active=1").fetchone()["n"])
     admin_user = get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT).strip()
     admin_pass = get_secret_value("CGI_ADMIN_PASS", "")
-    if n == 0 and admin_pass:
+    if active_admins == 0 and admin_pass:
         valid, _ = validate_password(admin_pass, admin_user, "admin", "Administrador")
-        if valid:
-            cur.execute(
-                "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (admin_user, hash_password(admin_pass), "Administrador", "", "", "admin", 1, now_iso(), now_iso()),
-            )
+        if valid and len(admin_user) >= 3 and re.fullmatch(r"[A-Za-z0-9._-]+", admin_user):
+            existing = cur.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (admin_user,)).fetchone()
+            if existing:
+                cur.execute(
+                    "UPDATE users SET password_hash=?, full_name=?, role='admin', active=1, failed_attempts=0, locked_until=NULL, password_changed_at=?, must_change_password=0 WHERE id=?",
+                    (hash_password(admin_pass), "Administrador", now_iso(), int(existing["id"])),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (admin_user, hash_password(admin_pass), "Administrador", "ADMIN", "", "admin", 1, now_iso(), now_iso()),
+                )
             con.commit()
             admin_created = True
     con.close()
@@ -3672,6 +3770,16 @@ def generate_automatic_backup(force: bool = False) -> dict:
         integrity = database_integrity_summary(db_file)
         if not integrity.get("ok"):
             raise RuntimeError(f"La base semanal no superó integridad: {integrity.get('error','sin detalle')}")
+        stable_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        stable_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
+        stable_db_integrity = database_integrity_summary(stable_db) if stable_db.exists() else {}
+        if int(integrity.get("studies", 0) or 0) == 0 and (
+            stable_xlsx.exists() or int(stable_db_integrity.get("studies", 0) or 0) > 0
+        ):
+            raise RuntimeError(
+                "Se evitó reemplazar respaldos estables con un corte sin estudios. "
+                "Revise restauración de DB/S3 antes de continuar."
+            )
 
         manifest = {
             "created_at": created_at,
@@ -3725,7 +3833,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
         set_system_state("last_weekly_backup_at", created_at)
         set_system_state("last_weekly_backup_status", "remote_ok" if remote_ok else ("local_only" if not _s3_configured() else "remote_error"))
 
-        # Conserva hasta 52 cortes semanales locales de cada tipo.
+        # Conserva hasta BACKUP_RETENTION_COUNT cortes semanales locales de cada tipo.
         for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx", "cgi_respaldo_*.json"):
             old = sorted(BACKUP_DIR.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
             for file in old:
@@ -3756,8 +3864,11 @@ def backup_admin_panel() -> None:
 
     last_persist = get_system_state("last_persist_at", "")
     last_error = get_system_state("last_persist_error", "")
+    last_warning = get_system_state("last_persist_warning", "")
     if last_persist:
         st.caption(f"Última sincronización estable posterior a una escritura: {last_persist}")
+    if last_warning:
+        st.warning(last_warning)
     if last_error:
         st.warning(f"Último error de persistencia registrado: {last_error}")
 
@@ -3833,6 +3944,7 @@ def backup_admin_panel() -> None:
 def app_main() -> None:
     css()
     migrated, migration_msg = migrate_legacy_local_database()
+    local_restored, local_restore_msg = restore_database_from_local_backup_if_missing()
     restored = False
     restore_msg = ""
     fresh_empty_bootstrap_used = False
@@ -3910,10 +4022,15 @@ def app_main() -> None:
         set_system_state("last_weekly_backup_error", str(exc)[:500])
     if migrated and migration_msg:
         st.success(migration_msg)
+    if local_restored and local_restore_msg:
+        st.success(local_restore_msg)
     if restored and restore_msg:
         st.success(restore_msg)
     if excel_restored and excel_restore_msg:
         st.success(excel_restore_msg)
+    excel_ready, excel_ready_msg = ensure_latest_excel_available()
+    if excel_ready and excel_ready_msg:
+        st.success(excel_ready_msg)
     if "user" not in st.session_state:
         login_ui()
         return
