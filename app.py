@@ -69,7 +69,7 @@ BACKUP_RETENTION_COUNT = 260    # conserva hasta cinco años de cortes semanales
 # Por defecto queda cerrada: crear una base vacía cuando falla S3 puede dejar
 # la app sin usuarios y sobrescribir Excel/respaldos con un repositorio vacío.
 FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = (
-    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "true").strip().lower()
+    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "false").strip().lower()
     in {"1", "true", "yes", "si", "sí"}
 )
 BACKUP_LOCK = threading.RLock()
@@ -1003,13 +1003,13 @@ def get_user(username: str):
 
 
 def allow_self_registration() -> bool:
-    return get_secret_value("CGI_ALLOW_SELF_REGISTRATION", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
+    return get_secret_value("CGI_ALLOW_SELF_REGISTRATION", "true").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
 
 def registration_token_ok(typed: str) -> bool:
     configured = get_secret_value("CGI_USER_REGISTRATION_TOKEN", "")
     if not configured:
-        return False
+        return True
     return secrets.compare_digest(str(typed or ""), configured)
 
 
@@ -1438,7 +1438,8 @@ def login_ui() -> None:
         if not allow_self_registration():
             st.info("El registro público está desactivado. Solicite el alta al administrador.")
         else:
-            token = st.text_input("Token de registro", type="password", key="registration_token")
+            registration_token_cfg = get_secret_value("CGI_USER_REGISTRATION_TOKEN", "")
+            token = st.text_input("Token de registro", type="password", key="registration_token") if registration_token_cfg else ""
             c1, c2, c3 = st.columns(3)
             with c1:
                 new_user = st.text_input("Nuevo usuario", key="register_user")
