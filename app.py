@@ -4303,17 +4303,4 @@ def app_main() -> None:
                 st.dataframe(audit_df, use_container_width=True)
             all_df = studies_df(None)
             all_wide = studies_wide_df(None)
-            st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
-            st.dataframe(all_wide, use_container_width=True)
-            backup_admin_panel()
-            st.download_button("Descargar Excel administrador completo", data=export_excel(user, only_current_user=False), file_name="cgi_excel_administrador_todos_los_usuarios_COMPLETO.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("Descargar Excel administrador delta cursores", data=export_cursor_delta_excel(user, only_current_user=False), file_name="delta_correccion_cursores_ADMIN.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-if __name__ == "__main__":
-    try:
-        app_main()
-    except Exception as exc:
-        css()
-        st.error("La aplicación encontró un error controlado.")
-        st.code(traceback.format_exc())
+            st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas
