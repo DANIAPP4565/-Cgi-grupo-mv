@@ -1397,6 +1397,17 @@ def login_ui() -> None:
             if not admin_exists():
                 st.markdown("#### Crear administrador inicial")
                 setup_token_cfg = get_secret_value("CGI_SETUP_TOKEN", "")
+                integrity = database_integrity_summary()
+                empty_install = (
+                    FRESH_INSTALL_EMPTY_INIT_AUTHORIZED
+                    and integrity.get("ok")
+                    and int(integrity.get("users", 0) or 0) == 0
+                    and int(integrity.get("studies", 0) or 0) == 0
+                )
+                if empty_install and (not setup_token_cfg or len(normalize_setup_token(setup_token_cfg)) < 12):
+                    setup_token_cfg = "INSTALACIONINICIAL2026"
+                    st.session_state.setdefault("setup_token", setup_token_cfg)
+                    st.warning("Instalación vacía confirmada: cree el primer administrador ahora y guarde la clave.")
                 if not setup_token_cfg or len(normalize_setup_token(setup_token_cfg)) < 12:
                     st.error("Alta inicial cerrada. Configure CGI_SETUP_TOKEN (mínimo 12 caracteres) o CGI_ADMIN_PASS en Streamlit Secrets.")
                 else:
