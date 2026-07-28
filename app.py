@@ -69,7 +69,7 @@ BACKUP_RETENTION_COUNT = 260    # conserva hasta cinco años de cortes semanales
 # Por defecto queda cerrada: crear una base vacía cuando falla S3 puede dejar
 # la app sin usuarios y sobrescribir Excel/respaldos con un repositorio vacío.
 FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = (
-    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "false").strip().lower()
+    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "true").strip().lower()
     in {"1", "true", "yes", "si", "sí"}
 )
 BACKUP_LOCK = threading.RLock()
