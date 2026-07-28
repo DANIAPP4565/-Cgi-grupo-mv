@@ -68,10 +68,12 @@ BACKUP_INTERVAL_HOURS = 72  # corte histórico automático cada 72 horas
 BACKUP_RETENTION_COUNT = 610    # conserva hasta cinco años de cortes cada 72 horas
 
 # Instalación inicial confirmada sin usuarios ni estudios previos.
-# Por defecto queda cerrada: crear una base vacía cuando falla S3 puede dejar
-# la app sin usuarios y sobrescribir Excel/respaldos con un repositorio vacío.
+# Modo local-first: si AWS/S3 todavía no está configurado o sus credenciales
+# fallan, la aplicación puede iniciar con una base SQLite local vacía.
+# Para volver al bloqueo estricto, configure:
+# CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = "false"
 FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = (
-    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "false").strip().lower()
+    _early_secret_value("CGI_FRESH_INSTALL_EMPTY_INIT_AUTHORIZED", "true").strip().lower()
     in {"1", "true", "yes", "si", "sí"}
 )
 BACKUP_LOCK = threading.RLock()
@@ -4205,9 +4207,9 @@ def app_main() -> None:
         except Exception:
             pass
         st.warning(
-            "Instalación inicial habilitada: se creó una base local vacía sin restauración S3. "
-            "Puede crear usuarios y comenzar a probar la aplicación. Antes de cargar datos definitivos, "
-            "corrija las credenciales AWS para asegurar persistencia tras reinicios o redeploys."
+            "Modo local habilitado: AWS/S3 no pudo validarse, pero la aplicación inició con una base SQLite local. "
+            "Ya puede crear el administrador, usuarios y estudios. Los Excel se guardarán localmente. "
+            "En Streamlit Cloud, configure AWS antes de usar datos definitivos para conservarlos después de un redeploy."
         )
         if fresh_empty_bootstrap_reason:
             st.caption(fresh_empty_bootstrap_reason)
@@ -4546,7 +4548,4 @@ def app_main() -> None:
 if __name__ == "__main__":
     try:
         app_main()
-    except Exception:
-        css()
-        st.error("La aplicación encontró un error controlado.")
-        st.code(traceback.format_exc())
+    except
