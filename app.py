@@ -37,7 +37,7 @@ except Exception:
     fitz = None
 
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
-APP_BUILD = "CGI-ROBUST-S3-V5-FRESHINIT-20260722"
+APP_BUILD = "CGI-REGISTRO-SIMPLE-EXCEL-V6-20260727"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
 
@@ -62,8 +62,10 @@ FILES_DIR = DATA_DIR / "archivos_cgi"
 BACKUP_DIR = DATA_DIR / "respaldos"
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BACKUP_INTERVAL_HOURS = 24 * 7  # respaldo histórico semanal
-BACKUP_RETENTION_COUNT = 260    # conserva hasta cinco años de cortes semanales
+USER_EXCEL_DIR = BACKUP_DIR / "excel_usuarios"
+USER_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_INTERVAL_HOURS = 72  # corte histórico automático cada 72 horas
+BACKUP_RETENTION_COUNT = 610    # conserva hasta cinco años de cortes cada 72 horas
 
 # Instalación inicial confirmada sin usuarios ni estudios previos.
 # Por defecto queda cerrada: crear una base vacía cuando falla S3 puede dejar
@@ -73,8 +75,8 @@ FRESH_INSTALL_EMPTY_INIT_AUTHORIZED = (
     in {"1", "true", "yes", "si", "sí"}
 )
 BACKUP_LOCK = threading.RLock()
-PASSWORD_MIN_LENGTH = 12
-ADMIN_PASSWORD_MIN_LENGTH = 14
+PASSWORD_MIN_LENGTH = 10
+ADMIN_PASSWORD_MIN_LENGTH = 12
 PASSWORD_MAX_LENGTH = 128
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
@@ -702,7 +704,8 @@ def atomic_write_bytes(path: Path, data: bytes) -> Path:
     return path
 
 
-def validate_excel_file(path: Path) -> None:
+def validate_excel_file(path: Path, expected_studies: int | None = None) -> None:
+    """Valida estructura y, cuando se indica, la cantidad de estudios exportados."""
     if not path.exists() or path.stat().st_size <= 0:
         raise RuntimeError("El Excel está vacío.")
     try:
@@ -710,11 +713,22 @@ def validate_excel_file(path: Path) -> None:
         wb = load_workbook(path, read_only=True, data_only=True)
         required = {"estudios", "diccionario_variables"}
         missing = required.difference(set(wb.sheetnames))
-        wb.close()
         if missing:
+            wb.close()
             raise RuntimeError(f"Faltan hojas obligatorias: {', '.join(sorted(missing))}")
+        if expected_studies is not None:
+            ws = wb["estudios"]
+            exported_rows = max(0, int(ws.max_row or 0) - 1)
+            if int(expected_studies) > 0 and exported_rows < int(expected_studies):
+                wb.close()
+                raise RuntimeError(
+                    f"El Excel contiene {exported_rows} estudios y se esperaban al menos {expected_studies}."
+                )
+        wb.close()
     except ImportError as exc:
-        raise RuntimeError("Falta openpyxl para validar el repositorio Excel.") from exc
+        raise RuntimeError(
+            "Falta openpyxl. Agréguelo a requirements.txt para generar y validar los Excel."
+        ) from exc
 
 
 def _upload_backup_to_s3(local_path: Path, remote_key: str) -> None:
@@ -802,46 +816,67 @@ def backup_due(hours: int = BACKUP_INTERVAL_HOURS) -> bool:
         return True
 
 
-def preserve_database_after_write(reason: str = "actualizacion") -> None:
-    """Sincroniza copia estable de DB y Excel después de cada modificación."""
+def preserve_database_after_write(reason: str = "actualizacion") -> dict:
+    """Guarda una copia SQLite y Excel inmediatamente después de cada escritura.
+
+    Devuelve un estado explícito para evitar que los errores de Excel queden
+    ocultos. La base clínica nunca se borra si falla un respaldo secundario.
+    """
+    result = {"ok": False, "database_ok": False, "excel_ok": False, "error": "", "reason": reason}
     try:
         with BACKUP_LOCK:
             latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
-            latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
             integrity = database_integrity_summary()
             previous_integrity = database_integrity_summary(latest_db) if latest_db.exists() else {}
             if (
                 int(integrity.get("studies", 0) or 0) == 0
                 and int(previous_integrity.get("studies", 0) or 0) > 0
             ):
-                set_system_state(
-                    "last_persist_error",
-                    "Se evitó sobrescribir un respaldo con estudios usando una base actual sin estudios.",
+                raise RuntimeError(
+                    "Se evitó sobrescribir un respaldo que contiene estudios con una base actual sin estudios."
                 )
-                return
+
             create_sqlite_snapshot(latest_db)
-            excel_builder = globals().get("export_excel")
-            if callable(excel_builder):
-                if int(integrity.get("studies", 0) or 0) == 0 and latest_xlsx.exists():
-                    set_system_state(
-                        "last_persist_warning",
-                        "Se evitó sobrescribir el Excel estable con una exportación sin estudios.",
-                    )
-                else:
-                    atomic_write_bytes(latest_xlsx, excel_builder({}, only_current_user=False))
-                    validate_excel_file(latest_xlsx)
+            result["database_ok"] = True
+
+            excel_sync = globals().get("sync_excel_repositories")
+            if callable(excel_sync):
+                excel_state = excel_sync()
+                result["excel_ok"] = bool(excel_state.get("ok"))
+                result["excel_state"] = excel_state
+                if not result["excel_ok"]:
+                    raise RuntimeError(excel_state.get("error", "No se pudo actualizar el repositorio Excel."))
+            else:
+                # Solo puede ocurrir durante una importación parcial del archivo.
+                result["excel_ok"] = False
+
             if _s3_configured():
                 prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
-                _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
+                _upload_backup_to_s3(
+                    latest_db,
+                    get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"),
+                )
+                latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
                 if latest_xlsx.exists():
-                    _upload_backup_to_s3(latest_xlsx, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
+                    _upload_backup_to_s3(
+                        latest_xlsx,
+                        get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"),
+                    )
+
+            result["ok"] = bool(result["database_ok"] and result["excel_ok"])
             set_system_state("last_persist_reason", reason)
             set_system_state("last_persist_at", now_iso())
+            set_system_state("last_persist_error", "")
+            set_system_state("last_persist_warning", "")
+            return result
     except Exception as exc:
+        result["error"] = str(exc)
         try:
-            set_system_state("last_persist_error", str(exc)[:500])
+            set_system_state("last_persist_error", str(exc)[:1000])
+            set_system_state("last_persist_reason", reason)
         except Exception:
             pass
+        return result
 
 
 def _ensure_column(con: sqlite3.Connection, table: str, column: str, definition: str) -> bool:
@@ -1018,8 +1053,10 @@ def create_user(username: str, password: str, full_name: str, matricula: str, pr
     full_name = (full_name or "").strip()
     if len(username) < 3 or not re.fullmatch(r"[A-Za-z0-9._-]+", username):
         return False, "El usuario debe tener al menos 3 caracteres y usar solo letras, números, punto, guion o guion bajo."
-    if not full_name or not str(matricula or "").strip() or not str(provincia or "").strip():
-        return False, "Complete nombre, matrícula y provincia."
+    if not full_name:
+        return False, "Complete el nombre del operador."
+    matricula = str(matricula or "").strip() or "SIN DATOS"
+    provincia = str(provincia or "").strip() or "Buenos Aires"
     valid, msg = validate_password(password, username, "user", full_name)
     if not valid:
         return False, msg
@@ -1029,7 +1066,7 @@ def create_user(username: str, password: str, full_name: str, matricula: str, pr
         con = connect()
         con.execute(
             "INSERT INTO users(username,password_hash,full_name,matricula,provincia,role,active,created_at,password_changed_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (username, hash_password(password), full_name, str(matricula).strip(), str(provincia).strip(), "user", 1, now_iso(), now_iso(), int(bool(must_change_password))),
+            (username, hash_password(password), full_name, matricula, provincia, "user", 1, now_iso(), now_iso(), int(bool(must_change_password))),
         )
         con.commit()
         con.close()
@@ -1254,135 +1291,235 @@ def forced_password_change_ui(user: dict) -> None:
 
 
 def admin_password_ui(current_user: dict) -> None:
+    """Panel único y simple para altas, claves, roles y estado de cuentas."""
     st.markdown(
-        "<div class='guide'><b>Seguridad:</b> hash scrypt con salt individual, migración automática de hashes antiguos, "
-        "bloqueo por intentos fallidos y auditoría. Las contraseñas nunca se listan ni se exportan.</div>",
+        "<div class='guide'><b>Gestión simple de cuentas.</b> Cree usuarios o administradores desde un único formulario. "
+        "Las claves se guardan con hash scrypt y nunca se exportan.</div>",
         unsafe_allow_html=True,
     )
+
     con = connect()
-    users_df = pd.read_sql_query("SELECT username,full_name,matricula,provincia,role,active,last_login_at,locked_until FROM users ORDER BY username", con)
+    users_df = pd.read_sql_query(
+        "SELECT username,full_name,matricula,provincia,role,active,last_login_at,locked_until "
+        "FROM users ORDER BY username",
+        con,
+    )
     con.close()
     all_users = users_df["username"].tolist() if not users_df.empty else []
-    admin_users = users_df.loc[users_df["role"].eq("admin"), "username"].tolist() if not users_df.empty else []
-    default_admin = current_user.get("username", "") if current_user.get("username", "") in all_users else (admin_users[0] if admin_users else "")
 
-    tgen, tmanual, tuser, tadmin = st.tabs([
-        "Generar clave admin", "Definir clave admin", "Crear/restablecer usuario", "Crear/convertir admin"
-    ])
-    with tgen:
-        target = st.selectbox("Administrador a modificar", admin_users or [default_admin], key="admin_pwd_target_generate")
-        length = st.slider("Longitud", 16, 32, 20, 1, key="admin_pwd_len")
-        if st.button("Generar nueva clave de administrador", type="primary", key="btn_generate_admin_pwd"):
-            new_pass = generate_password(int(length))
-            ok, msg = set_user_password(target, new_pass)
-            if ok:
-                st.success(msg)
-                st.warning("Copie la clave ahora: se muestra una sola vez.")
-                st.code(new_pass, language=None)
-            else:
-                st.error(msg)
+    alta, gestionar, propia = st.tabs(["Alta rápida", "Gestionar cuentas", "Mi contraseña"])
 
-    with tmanual:
-        target2 = st.selectbox("Administrador", admin_users or [default_admin], key="admin_pwd_target_manual")
-        p1 = st.text_input("Nueva clave", type="password", key="admin_pwd_manual_1")
-        p2 = st.text_input("Repetir nueva clave", type="password", key="admin_pwd_manual_2")
-        if p1:
-            st.caption(f"Fortaleza estimada: {password_strength_label(p1)}")
-        if st.button("Guardar clave manual", type="primary", key="btn_manual_admin_pwd"):
-            if p1 != p2:
+    with alta:
+        c1, c2 = st.columns(2)
+        with c1:
+            role_label = st.radio(
+                "Tipo de cuenta",
+                ["Usuario", "Administrador"],
+                horizontal=True,
+                key="simple_account_role",
+            )
+            username = st.text_input("Usuario", key="simple_account_username")
+            full_name = st.text_input(
+                "Nombre visible",
+                value="Administrador" if role_label == "Administrador" else "",
+                key="simple_account_full_name",
+            )
+        with c2:
+            auto_password = st.checkbox(
+                "Generar clave provisoria automáticamente",
+                value=True,
+                key="simple_account_auto_password",
+            )
+            password = "" if auto_password else st.text_input(
+                "Clave",
+                type="password",
+                key="simple_account_password",
+            )
+            repeat = "" if auto_password else st.text_input(
+                "Repetir clave",
+                type="password",
+                key="simple_account_password_repeat",
+            )
+
+        matricula = ""
+        provincia = "Buenos Aires"
+        if role_label == "Usuario":
+            with st.expander("Datos profesionales opcionales", expanded=False):
+                matricula = st.text_input("Matrícula", key="simple_account_matricula")
+                provincia = st.text_input(
+                    "Provincia",
+                    value="Buenos Aires",
+                    key="simple_account_provincia",
+                )
+
+        if st.button("Crear cuenta", type="primary", key="simple_create_account"):
+            if not auto_password and password != repeat:
                 st.error("Las claves no coinciden.")
             else:
-                ok, msg = set_user_password(target2, p1)
-                st.success(msg) if ok else st.error(msg)
-
-    with tuser:
-        mode = st.radio("Acción", ["Crear usuario", "Restablecer contraseña"], horizontal=True, key="user_admin_action")
-        if mode == "Crear usuario":
-            c1, c2 = st.columns(2)
-            with c1:
-                u = st.text_input("Nuevo usuario", key="admin_new_user")
-                name = st.text_input("Nombre del operador", key="admin_new_user_name")
-                mat = st.text_input("Matrícula", key="admin_new_user_mat")
-                prov = st.text_input("Provincia", value="Buenos Aires", key="admin_new_user_prov")
-            with c2:
-                auto = st.checkbox("Generar contraseña provisoria", value=True, key="admin_new_user_auto_pwd")
-                p1u = "" if auto else st.text_input("Contraseña provisoria", type="password", key="admin_new_user_pwd1")
-                p2u = "" if auto else st.text_input("Repetir contraseña", type="password", key="admin_new_user_pwd2")
-            if st.button("Crear usuario", type="primary", key="admin_create_user"):
-                pwd = generate_password(20) if auto else p1u
-                if not auto and p1u != p2u:
-                    st.error("Las claves no coinciden.")
+                generated = generate_password(20 if role_label == "Usuario" else 22)
+                final_password = generated if auto_password else password
+                if role_label == "Administrador":
+                    ok, msg = create_admin_user(username, final_password, full_name or "Administrador")
                 else:
-                    ok, msg = create_user(u, pwd, name, mat, prov, must_change_password=1)
-                    if ok:
-                        st.success(msg)
-                        st.warning("El usuario deberá cambiar esta contraseña en el primer ingreso.")
-                        if auto:
-                            st.code(pwd, language=None)
-                    else:
-                        st.error(msg)
-        else:
-            regular = users_df.loc[users_df["role"].eq("user"), "username"].tolist() if not users_df.empty else []
-            target_u = st.selectbox("Usuario", regular or all_users, key="admin_reset_user_select")
-            auto_reset = st.checkbox("Generar contraseña provisoria", value=True, key="admin_reset_auto")
-            rp1 = "" if auto_reset else st.text_input("Nueva contraseña provisoria", type="password", key="admin_reset_pwd1")
-            rp2 = "" if auto_reset else st.text_input("Repetir contraseña", type="password", key="admin_reset_pwd2")
-            if st.button("Restablecer contraseña", type="primary", key="admin_reset_user_pwd"):
-                pwd = generate_password(20) if auto_reset else rp1
-                if not auto_reset and rp1 != rp2:
-                    st.error("Las claves no coinciden.")
-                else:
-                    ok, msg = set_user_password(target_u, pwd, force_change=True)
-                    if ok:
-                        st.success(msg)
-                        st.warning("El usuario deberá cambiarla al ingresar.")
-                        if auto_reset:
-                            st.code(pwd, language=None)
-                    else:
-                        st.error(msg)
-
-    with tadmin:
-        new_admin = st.text_input("Usuario a crear o convertir", key="new_admin_user")
-        new_admin_name = st.text_input("Nombre visible", value="Administrador", key="new_admin_name")
-        auto_admin = st.checkbox("Generar clave automática", value=True, key="new_admin_auto")
-        ap1 = "" if auto_admin else st.text_input("Clave", type="password", key="new_admin_pass_1")
-        ap2 = "" if auto_admin else st.text_input("Repetir clave", type="password", key="new_admin_pass_2")
-        if st.button("Crear/actualizar administrador", type="primary", key="btn_create_admin"):
-            pwd = generate_password(22) if auto_admin else ap1
-            if not auto_admin and ap1 != ap2:
-                st.error("Las claves no coinciden.")
-            else:
-                ok, msg = create_admin_user(new_admin, pwd, new_admin_name)
+                    ok, msg = create_user(
+                        username,
+                        final_password,
+                        full_name,
+                        matricula,
+                        provincia,
+                        must_change_password=1 if auto_password else 0,
+                    )
                 if ok:
                     st.success(msg)
-                    if auto_admin:
-                        st.code(pwd, language=None)
+                    if auto_password:
+                        st.warning("Copie esta clave ahora. Se muestra una sola vez.")
+                        st.code(final_password, language=None)
                 else:
                     st.error(msg)
 
-    st.markdown("#### Roles, estado y bloqueos")
-    if all_users:
-        u = st.selectbox("Usuario", all_users, key="role_user_select")
-        selected = users_df[users_df["username"].eq(u)].iloc[0]
-        role = st.selectbox("Rol", ["user", "admin"], index=1 if selected["role"] == "admin" else 0, key="role_select")
-        active = st.checkbox("Usuario activo", value=bool(selected["active"]), key="role_active")
-        st.caption(f"Último ingreso: {selected.get('last_login_at') or '—'} · Bloqueado hasta: {selected.get('locked_until') or '—'}")
-        if st.button("Actualizar rol/estado", key="btn_update_role"):
-            ok, msg = set_user_role(u, role, 1 if active else 0)
-            st.success(msg) if ok else st.error(msg)
-            if ok and u == current_user.get("username"):
-                st.session_state.user = dict(get_user(u))
+    with gestionar:
+        if not all_users:
+            st.info("Todavía no hay cuentas para administrar.")
+        else:
+            selected_username = st.selectbox("Cuenta", all_users, key="simple_manage_user")
+            selected = users_df[users_df["username"].eq(selected_username)].iloc[0]
+            c1, c2 = st.columns(2)
+            with c1:
+                new_role = st.selectbox(
+                    "Rol",
+                    ["user", "admin"],
+                    index=1 if selected["role"] == "admin" else 0,
+                    format_func=lambda value: "Administrador" if value == "admin" else "Usuario",
+                    key="simple_manage_role",
+                )
+                active = st.checkbox(
+                    "Cuenta activa",
+                    value=bool(selected["active"]),
+                    key="simple_manage_active",
+                )
+                st.caption(
+                    f"Último ingreso: {selected.get('last_login_at') or '—'} · "
+                    f"Bloqueada hasta: {selected.get('locked_until') or '—'}"
+                )
+                if st.button("Guardar rol y estado", key="simple_save_role_status"):
+                    ok, msg = set_user_role(selected_username, new_role, 1 if active else 0)
+                    st.success(msg) if ok else st.error(msg)
+                    if ok and selected_username == current_user.get("username"):
+                        refreshed = get_user(selected_username)
+                        if refreshed:
+                            st.session_state.user = dict(refreshed)
+                    if ok:
+                        st.rerun()
+            with c2:
+                auto_reset = st.checkbox(
+                    "Generar nueva clave provisoria",
+                    value=True,
+                    key="simple_reset_auto",
+                )
+                reset_password = "" if auto_reset else st.text_input(
+                    "Nueva clave",
+                    type="password",
+                    key="simple_reset_password",
+                )
+                reset_repeat = "" if auto_reset else st.text_input(
+                    "Repetir nueva clave",
+                    type="password",
+                    key="simple_reset_repeat",
+                )
+                if st.button("Restablecer clave", type="primary", key="simple_reset_button"):
+                    if not auto_reset and reset_password != reset_repeat:
+                        st.error("Las claves no coinciden.")
+                    else:
+                        final_password = generate_password(20) if auto_reset else reset_password
+                        ok, msg = set_user_password(selected_username, final_password, force_change=auto_reset)
+                        if ok:
+                            st.success(msg)
+                            if auto_reset:
+                                st.warning("Copie esta clave ahora. El usuario deberá cambiarla al ingresar.")
+                                st.code(final_password, language=None)
+                        else:
+                            st.error(msg)
+
+    with propia:
+        current = st.text_input("Clave actual", type="password", key="simple_own_current")
+        new_password = st.text_input("Nueva clave", type="password", key="simple_own_new")
+        repeat_password = st.text_input("Repetir nueva clave", type="password", key="simple_own_repeat")
+        if st.button("Cambiar mi clave", type="primary", key="simple_own_change"):
+            if new_password != repeat_password:
+                st.error("Las claves no coinciden.")
+            else:
+                ok, msg = change_own_password(current_user, current, new_password)
+                st.success(msg) if ok else st.error(msg)
 
 
 def login_ui() -> None:
-    st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
     st.markdown(
-        "<div class='guide'><b>Ingreso protegido.</b> Claves con hash robusto, bloqueo temporal tras intentos fallidos y sesiones con vencimiento. "
-        "Los Excel exportan código anónimo, no nombre del paciente.</div>", unsafe_allow_html=True
+        f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><div class='dev'>{APP_DEVELOPER}</div></div>",
+        unsafe_allow_html=True,
     )
-    t1, t2 = st.tabs(["Ingresar", "Registro de usuario"])
-    with t1:
+
+    if not admin_exists():
+        st.markdown("### Crear administrador inicial")
+        integrity = database_integrity_summary()
+        empty_repository = (
+            integrity.get("ok")
+            and int(integrity.get("users", 0) or 0) == 0
+            and int(integrity.get("studies", 0) or 0) == 0
+        )
+        configured_token = get_secret_value("CGI_SETUP_TOKEN", "")
+        require_token = not empty_repository
+        if require_token and len(normalize_setup_token(configured_token)) < 12:
+            st.error(
+                "La base contiene datos pero no hay un administrador activo. Configure CGI_SETUP_TOKEN "
+                "en Streamlit Secrets para recuperar la administración sin exponer las cuentas existentes."
+            )
+            return
+
         c1, c2 = st.columns(2)
+        with c1:
+            admin_user_init = st.text_input(
+                "Usuario administrador",
+                value=get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT),
+                key="setup_admin_user_simple",
+            )
+            admin_name = st.text_input(
+                "Nombre visible",
+                value="Administrador",
+                key="setup_admin_name_simple",
+            )
+            setup_token = ""
+            if require_token:
+                setup_token = st.text_input(
+                    "Token de recuperación",
+                    type="password",
+                    key="setup_token_simple",
+                )
+        with c2:
+            auto = st.checkbox("Generar clave segura", value=True, key="setup_admin_auto_simple")
+            p1 = "" if auto else st.text_input("Clave", type="password", key="setup_admin_pass1_simple")
+            p2 = "" if auto else st.text_input("Repetir clave", type="password", key="setup_admin_pass2_simple")
+
+        if st.button("Crear administrador", type="primary", key="btn_setup_admin_simple"):
+            if require_token and not setup_token_ok(setup_token, configured_token):
+                st.error("Token de recuperación incorrecto.")
+            elif not auto and p1 != p2:
+                st.error("Las claves no coinciden.")
+            else:
+                password = generate_password(22) if auto else p1
+                ok, msg = create_admin_user(admin_user_init, password, admin_name)
+                if ok:
+                    st.success(msg)
+                    if auto:
+                        st.warning("Copie esta clave ahora. Se muestra una sola vez.")
+                        st.code(password, language=None)
+                    st.info("La cuenta quedó creada. En el próximo refresco aparecerá el formulario de ingreso.")
+                else:
+                    st.error(msg)
+        return
+
+    ingresar, registrar = st.tabs(["Ingresar", "Crear usuario"])
+    with ingresar:
+        c1, c2 = st.columns([1, 1])
         with c1:
             username = st.text_input("Usuario", key="login_username")
             password = st.text_input("Contraseña", type="password", key="login_password")
@@ -1394,69 +1531,42 @@ def login_ui() -> None:
                 else:
                     st.error(msg)
         with c2:
-            if not admin_exists():
-                st.markdown("#### Crear administrador inicial")
-                setup_token_cfg = get_secret_value("CGI_SETUP_TOKEN", "")
-                integrity = database_integrity_summary()
-                empty_install = (
-                    FRESH_INSTALL_EMPTY_INIT_AUTHORIZED
-                    and integrity.get("ok")
-                    and int(integrity.get("users", 0) or 0) == 0
-                    and int(integrity.get("studies", 0) or 0) == 0
-                )
-                if empty_install and (not setup_token_cfg or len(normalize_setup_token(setup_token_cfg)) < 12):
-                    setup_token_cfg = "INSTALACIONINICIAL2026"
-                    st.session_state.setdefault("setup_token", setup_token_cfg)
-                    st.warning("Instalación vacía confirmada: cree el primer administrador ahora y guarde la clave.")
-                if not setup_token_cfg or len(normalize_setup_token(setup_token_cfg)) < 12:
-                    st.error("Alta inicial cerrada. Configure CGI_SETUP_TOKEN (mínimo 12 caracteres) o CGI_ADMIN_PASS en Streamlit Secrets.")
-                else:
-                    setup_token = st.text_input("Token de instalación", type="password", key="setup_token")
-                    admin_user_init = st.text_input("Usuario administrador", value=get_secret_value("CGI_ADMIN_USER", ADMIN_USER_DEFAULT), key="setup_admin_user")
-                    auto = st.checkbox("Generar clave segura", value=True, key="setup_admin_auto")
-                    ip1 = "" if auto else st.text_input("Clave administrador", type="password", key="setup_admin_pass1")
-                    ip2 = "" if auto else st.text_input("Repetir clave", type="password", key="setup_admin_pass2")
-                    if st.button("Crear administrador inicial", type="primary", key="btn_setup_admin"):
-                        if not setup_token_ok(setup_token, setup_token_cfg):
-                            st.error("Token de instalación incorrecto.")
-                        elif not auto and ip1 != ip2:
-                            st.error("Las claves no coinciden.")
-                        else:
-                            pwd = generate_password(22) if auto else ip1
-                            ok, msg = create_admin_user(admin_user_init, pwd, "Administrador")
-                            if ok:
-                                st.success(msg)
-                                if auto:
-                                    st.warning("Copie esta clave ahora. No volverá a mostrarse.")
-                                    st.code(pwd, language=None)
-                            else:
-                                st.error(msg)
-            else:
-                st.info("Las altas, restablecimientos y cambios de rol se administran desde el panel protegido del administrador.")
+            st.markdown(
+                "<div class='guide'><b>Acceso simple.</b> Los estudios se guardan en SQLite y se actualizan "
+                "automáticamente en Excel después de cada alta o corrección.</div>",
+                unsafe_allow_html=True,
+            )
 
-    with t2:
+    with registrar:
         if not allow_self_registration():
-            st.info("El registro público está desactivado. Solicite el alta al administrador.")
+            st.info("El registro público está desactivado. El administrador puede crear la cuenta desde Administración.")
         else:
             registration_token_cfg = get_secret_value("CGI_USER_REGISTRATION_TOKEN", "")
-            token = st.text_input("Token de registro", type="password", key="registration_token") if registration_token_cfg else ""
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1:
-                new_user = st.text_input("Nuevo usuario", key="register_user")
-                new_pass = st.text_input("Nueva contraseña", type="password", key="register_password")
-                if new_pass:
-                    st.caption(f"Fortaleza estimada: {password_strength_label(new_pass)}")
+                new_user = st.text_input("Usuario", key="register_user_simple")
+                full_name = st.text_input("Nombre del operador", key="register_name_simple")
+                token = ""
+                if registration_token_cfg:
+                    token = st.text_input("Token de registro", type="password", key="registration_token_simple")
             with c2:
-                full_name = st.text_input("Nombre del operador", key="register_name")
-                matricula = st.text_input("Matrícula profesional", key="register_matricula")
-            with c3:
-                provincia = st.selectbox("Provincia", ["", "Buenos Aires", "CABA", "Catamarca", "Chaco", "Chubut", "Córdoba", "Corrientes", "Entre Ríos", "Formosa", "Jujuy", "La Pampa", "La Rioja", "Mendoza", "Misiones", "Neuquén", "Río Negro", "Salta", "San Juan", "San Luis", "Santa Cruz", "Santa Fe", "Santiago del Estero", "Tierra del Fuego", "Tucumán"], key="register_province")
-            if st.button("Registrar", key="register_button"):
+                new_pass = st.text_input("Contraseña", type="password", key="register_password_simple")
+                repeat_pass = st.text_input("Repetir contraseña", type="password", key="register_password_repeat_simple")
+                with st.expander("Datos profesionales opcionales", expanded=False):
+                    matricula = st.text_input("Matrícula", key="register_matricula_simple")
+                    provincia = st.text_input("Provincia", value="Buenos Aires", key="register_province_simple")
+            if st.button("Crear mi usuario", type="primary", key="register_button_simple"):
                 if not registration_token_ok(token):
                     st.error("Token de registro inválido.")
+                elif new_pass != repeat_pass:
+                    st.error("Las claves no coinciden.")
                 else:
                     ok, msg = create_user(new_user, new_pass, full_name, matricula, provincia)
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                        st.info("La cuenta quedó activa. Ingrese desde la pestaña Ingresar.")
+                    else:
+                        st.error(msg)
 
 
 # ============================================================
@@ -3764,8 +3874,82 @@ def export_excel(scope_user: dict, only_current_user: bool = True) -> bytes:
     return bio.getvalue()
 
 
+def safe_excel_component(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "usuario").strip())
+    return value.strip("._-") or "usuario"
+
+
+def user_excel_path(username: str) -> Path:
+    return USER_EXCEL_DIR / f"cgi_estudios_{safe_excel_component(username)}.xlsx"
+
+
+def sync_excel_repositories() -> dict:
+    """Materializa el Excel global y un Excel estable por cada cuenta.
+
+    Esta función se ejecuta inmediatamente después de guardar un estudio,
+    corregir cursores o modificar usuarios. Los archivos quedan disponibles en
+    el disco persistente configurado y el global se replica en S3 cuando aplica.
+    """
+    state = {"ok": False, "global_file": "", "user_files": [], "studies": 0, "error": ""}
+    try:
+        integrity = database_integrity_summary()
+        if not integrity.get("ok"):
+            raise RuntimeError(integrity.get("error", "La base no superó el control de integridad."))
+        total_studies = int(integrity.get("studies", 0) or 0)
+        latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        atomic_write_bytes(latest, export_excel({}, only_current_user=False))
+        validate_excel_file(latest, expected_studies=total_studies)
+        state["global_file"] = str(latest)
+        state["studies"] = total_studies
+
+        con = connect()
+        users = con.execute(
+            "SELECT id,username FROM users WHERE active=1 ORDER BY id"
+        ).fetchall()
+        counts = {
+            int(row["user_id"]): int(row["n"])
+            for row in con.execute(
+                "SELECT user_id,COUNT(*) AS n FROM studies GROUP BY user_id"
+            ).fetchall()
+        }
+        con.close()
+
+        for row in users:
+            uid = int(row["id"])
+            username = str(row["username"])
+            scope = {"id": uid, "username": username, "role": "user"}
+            path = user_excel_path(username)
+            atomic_write_bytes(path, export_excel(scope, only_current_user=True))
+            validate_excel_file(path, expected_studies=counts.get(uid, 0))
+            state["user_files"].append(str(path))
+
+        state["ok"] = True
+        return state
+    except Exception as exc:
+        state["error"] = str(exc)
+        return state
+
+
+def ensure_user_excel_available(user: dict) -> tuple[Path | None, str]:
+    path = user_excel_path(user.get("username", "usuario"))
+    try:
+        con = connect()
+        expected = int(
+            con.execute("SELECT COUNT(*) FROM studies WHERE user_id=?", (int(user["id"]),)).fetchone()[0]
+        )
+        con.close()
+        if not path.exists():
+            state = sync_excel_repositories()
+            if not state.get("ok"):
+                return None, state.get("error", "No se pudo generar el Excel del usuario.")
+        validate_excel_file(path, expected_studies=expected)
+        return path, ""
+    except Exception as exc:
+        return None, str(exc)
+
+
 def generate_automatic_backup(force: bool = False) -> dict:
-    """Genera un corte histórico semanal de SQLite + Excel + manifiesto SHA-256."""
+    """Genera un corte histórico cada 72 horas de SQLite + Excel + manifiesto SHA-256."""
     with BACKUP_LOCK:
         if not force and not backup_due():
             return read_backup_state()
@@ -3845,7 +4029,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
         set_system_state("last_weekly_backup_at", created_at)
         set_system_state("last_weekly_backup_status", "remote_ok" if remote_ok else ("local_only" if not _s3_configured() else "remote_error"))
 
-        # Conserva hasta BACKUP_RETENTION_COUNT cortes semanales locales de cada tipo.
+        # Conserva hasta BACKUP_RETENTION_COUNT cortes cada 72 horas locales de cada tipo.
         for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx", "cgi_respaldo_*.json"):
             old = sorted(BACKUP_DIR.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
             for file in old:
@@ -3857,7 +4041,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
 
 
 def backup_admin_panel() -> None:
-    st.markdown("#### Repositorio persistente y respaldo semanal")
+    st.markdown("#### Repositorio persistente y respaldo cada 72 horas")
     integrity = database_integrity_summary()
     if integrity.get("ok"):
         st.success(
@@ -3869,10 +4053,10 @@ def backup_admin_panel() -> None:
 
     state = read_backup_state()
     if state:
-        st.info(f"Último corte semanal: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
+        st.info(f"Último corte cada 72 horas: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
         st.caption(f"SHA-256 Excel: {state.get('excel_sha256','—')} · SHA-256 DB: {state.get('database_sha256','—')}")
     else:
-        st.warning("Todavía no se generó el primer corte semanal.")
+        st.warning("Todavía no se generó el primer corte cada 72 horas.")
 
     last_persist = get_system_state("last_persist_at", "")
     last_error = get_system_state("last_persist_error", "")
@@ -3886,7 +4070,7 @@ def backup_admin_panel() -> None:
 
     if _s3_configured():
         if state.get("remote_ok"):
-            st.success("Persistencia remota S3 activa: copia estable tras cambios y corte histórico semanal versionado.")
+            st.success("Persistencia remota S3 activa: copia estable tras cambios y corte histórico cada 72 horas versionado.")
         else:
             st.warning(f"S3 está configurado, pero el último corte no confirmó la subida: {state.get('remote_error','sin detalle')}")
         if st.button("Diagnosticar acceso S3", key="diagnose_s3_access"):
@@ -3908,7 +4092,7 @@ def backup_admin_panel() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Generar corte semanal ahora", key="force_backup_now"):
+        if st.button("Generar corte cada 72 horas ahora", key="force_backup_now"):
             try:
                 state = generate_automatic_backup(force=True)
                 st.success(f"Respaldo validado: {state.get('created_at','')}")
@@ -3921,7 +4105,7 @@ def backup_admin_panel() -> None:
     with c2:
         if latest_xlsx.exists():
             st.download_button(
-                "Descargar Excel semanal más reciente",
+                "Descargar Excel actualizado más reciente",
                 data=latest_xlsx.read_bytes(),
                 file_name=f"cgi_repositorio_semanal_{date.today().isoformat()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3944,7 +4128,7 @@ def backup_admin_panel() -> None:
             key="download_latest_manifest",
         )
     st.caption(
-        "La app genera y conserva el archivo semanal automáticamente. La descarga al disco de la computadora requiere pulsar el botón, "
+        "La app genera y conserva el archivo actualizado automáticamente. La descarga al disco de la computadora requiere pulsar el botón, "
         "porque los navegadores bloquean descargas automáticas sin interacción del usuario."
     )
 
@@ -4187,7 +4371,15 @@ def app_main() -> None:
                     st.session_state.last_image = img
                     st.session_state.last_source = source
                     st.session_state.last_page = int(page)
-                    st.success(f"Informe guardado con ID {sid}. Código anónimo: {patient_code}")
+                    persist_error = get_system_state("last_persist_error", "")
+                    if persist_error:
+                        st.warning(
+                            f"El estudio quedó guardado en la base con ID {sid}, pero el Excel no pudo actualizarse: {persist_error}"
+                        )
+                    else:
+                        st.success(
+                            f"Informe guardado con ID {sid}. Código anónimo: {patient_code}. Excel actualizado automáticamente."
+                        )
             except Exception as exc:
                 st.error(f"No se pudo procesar el informe: {exc}")
                 st.exception(exc)
@@ -4274,12 +4466,36 @@ def app_main() -> None:
 
     elif section == "3. Mis Excel":
         st.subheader("Mis estudios guardados")
-        df = studies_df(user)
         df_wide = studies_wide_df(user)
-        st.caption("Vista principal: cada fila es un estudio y las columnas incluyen TODAS las variables CGI, incluidas las hemodinámicas.")
+        st.caption(
+            "Cada fila corresponde a un estudio. El archivo se actualiza automáticamente después de cada guardado."
+        )
         st.dataframe(df_wide, use_container_width=True)
-        st.download_button("Descargar mi Excel completo", data=export_excel(user, only_current_user=True), file_name=f"cgi_excel_completo_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Descargar Excel delta corrección de cursores", data=export_cursor_delta_excel(user, only_current_user=True), file_name=f"delta_correccion_cursores_{user['username']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        my_excel, excel_error = ensure_user_excel_available(user)
+        if my_excel and my_excel.exists():
+            st.success(f"Excel estable disponible: {len(df_wide)} estudio/s.")
+            st.download_button(
+                "Descargar mi Excel guardado",
+                data=my_excel.read_bytes(),
+                file_name=f"cgi_excel_completo_{user['username']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_persistent_user_excel",
+            )
+        else:
+            st.error(f"No se pudo materializar el Excel: {excel_error or 'sin detalle'}")
+            st.download_button(
+                "Descargar Excel generado en el momento",
+                data=export_excel(user, only_current_user=True),
+                file_name=f"cgi_excel_completo_{user['username']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_dynamic_user_excel",
+            )
+        st.download_button(
+            "Descargar Excel delta corrección de cursores",
+            data=export_cursor_delta_excel(user, only_current_user=True),
+            file_name=f"delta_correccion_cursores_{user['username']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     elif section == "4. Administración":
         if user.get("role") != "admin":
@@ -4303,4 +4519,34 @@ def app_main() -> None:
                 st.dataframe(audit_df, use_container_width=True)
             all_df = studies_df(None)
             all_wide = studies_wide_df(None)
-            st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas
+            st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
+            st.dataframe(all_wide, use_container_width=True)
+            backup_admin_panel()
+            latest_admin_excel = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+            if not latest_admin_excel.exists():
+                sync_state = sync_excel_repositories()
+                if not sync_state.get("ok"):
+                    st.error(f"No se pudo generar el Excel administrador: {sync_state.get('error','sin detalle')}")
+            if latest_admin_excel.exists():
+                st.download_button(
+                    "Descargar Excel administrador guardado",
+                    data=latest_admin_excel.read_bytes(),
+                    file_name="cgi_excel_administrador_todos_los_usuarios_COMPLETO.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_persistent_admin_excel",
+                )
+            st.download_button(
+                "Descargar Excel administrador delta cursores",
+                data=export_cursor_delta_excel(user, only_current_user=False),
+                file_name="delta_correccion_cursores_ADMIN.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+
+if __name__ == "__main__":
+    try:
+        app_main()
+    except Exception:
+        css()
+        st.error("La aplicación encontró un error controlado.")
+        st.code(traceback.format_exc())
