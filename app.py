@@ -37,7 +37,7 @@ except Exception:
     fitz = None
 
 APP_TITLE = "Repositorio CGI para correlación y concordancia interusuario"
-APP_BUILD = "CGI-REGISTRO-SIMPLE-EXCEL-V6-20260727"
+APP_BUILD = "CGI-REGISTRO-SIMPLE-EXCEL-LOCAL-V7-20260801"
 APP_SUBTITLE = "Digitalización de informe completo Exxer/Z-Logic + anonimización + Excel por usuario y administrador"
 APP_DEVELOPER = "Desarrollador: Dr. Olano Ricardo Daniel — Cardiólogo Hipertensólogo"
 
@@ -62,8 +62,38 @@ FILES_DIR = DATA_DIR / "archivos_cgi"
 BACKUP_DIR = DATA_DIR / "respaldos"
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-USER_EXCEL_DIR = BACKUP_DIR / "excel_usuarios"
+
+# ============================================================
+# REPOSITORIO EXCEL LOCAL-ONLY
+# ============================================================
+# Los Excel derivados de los PDF NO se suben ni se restauran desde S3.
+# Para una ejecución local en Windows puede configurar, por ejemplo:
+# CGI_LOCAL_EXCEL_DIR = r"C:\\Repositorio_CGI\\Excel"
+# Si no se configura, se usa una carpeta local dentro de CGI_DATA_DIR.
+_LOCAL_EXCEL_RAW = _early_secret_value(
+    "CGI_LOCAL_EXCEL_DIR",
+    os.getenv("CGI_LOCAL_EXCEL_DIR", ""),
+).strip()
+LOCAL_EXCEL_DIR = (
+    Path(_LOCAL_EXCEL_RAW).expanduser()
+    if _LOCAL_EXCEL_RAW
+    else DATA_DIR / "repositorio_excel_local"
+)
+LOCAL_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
+USER_EXCEL_DIR = LOCAL_EXCEL_DIR / "usuarios"
+HISTORICAL_EXCEL_DIR = LOCAL_EXCEL_DIR / "historico"
 USER_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
+HISTORICAL_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
+GLOBAL_EXCEL_PATH = LOCAL_EXCEL_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+EXCEL_STORAGE_POLICY = "local_only"
+
+# Modo privacidad local completo: desactiva restauraciones y subidas S3 tanto
+# de Excel como de la base SQLite que contiene los valores importados.
+LOCAL_ONLY_MODE = (
+    _early_secret_value("CGI_LOCAL_ONLY_MODE", "true").strip().lower()
+    in {"1", "true", "yes", "si", "sí"}
+)
+
 BACKUP_INTERVAL_HOURS = 72  # corte histórico automático cada 72 horas
 BACKUP_RETENTION_COUNT = 610    # conserva hasta cinco años de cortes cada 72 horas
 
@@ -315,7 +345,9 @@ def s3_configuration_status() -> dict:
 
 
 def _s3_configured() -> bool:
-    """True solo cuando el bucket es real y no quedaron placeholders de ejemplo."""
+    """S3 queda totalmente inhabilitado cuando la app está en modo local-only."""
+    if LOCAL_ONLY_MODE:
+        return False
     return bool(s3_configuration_status().get("configured"))
 
 
@@ -580,31 +612,13 @@ def restore_database_from_local_backup_if_missing() -> tuple[bool, str]:
 
 
 def restore_latest_excel_from_remote_if_missing() -> tuple[bool, str]:
-    """Recupera el Excel estable para que siga disponible tras un redeploy."""
-    latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
-    if latest.exists() or not _s3_configured():
-        return False, ""
-    bucket = get_secret_value("CGI_S3_BUCKET", "")
-    prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
-    key = get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx")
-    tmp = latest.with_suffix(".restore.tmp.xlsx")
-    try:
-        _s3_client().download_file(bucket, key, str(tmp))
-        validate_excel_file(tmp)
-        tmp.replace(latest)
-        return True, "Excel histórico recuperado desde almacenamiento remoto."
-    except Exception as exc:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        return False, f"No se pudo recuperar el Excel remoto: {exc}"
+    """Política local-only: nunca descarga Excel desde S3 ni otra nube."""
+    return False, ""
 
 
 def ensure_latest_excel_available() -> tuple[bool, str]:
     """Asegura un Excel estable local sin depender de descargas del navegador."""
-    latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    latest = GLOBAL_EXCEL_PATH
     if latest.exists():
         try:
             validate_excel_file(latest)
@@ -627,10 +641,10 @@ def ensure_latest_excel_available() -> tuple[bool, str]:
     try:
         atomic_write_bytes(latest, excel_builder({}, only_current_user=False))
         validate_excel_file(latest)
-        if _s3_configured():
-            prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
-            _upload_backup_to_s3(latest, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
-        return True, f"Excel estable regenerado desde la base local: {integrity.get('studies',0)} estudios."
+        return True, (
+            f"Excel local regenerado: {integrity.get('studies',0)} estudios. "
+            f"Ubicación: {latest}"
+        )
     except Exception as exc:
         return False, f"No se pudo regenerar el Excel estable: {exc}"
 
@@ -853,18 +867,18 @@ def preserve_database_after_write(reason: str = "actualizacion") -> dict:
                 result["excel_ok"] = False
 
             if _s3_configured():
+                # Solo se ejecuta cuando CGI_LOCAL_ONLY_MODE=false. El Excel
+                # continúa excluido; esta rama conserva únicamente la DB.
                 prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
                 _upload_backup_to_s3(
                     latest_db,
                     get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"),
                 )
-                latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
-                if latest_xlsx.exists():
-                    _upload_backup_to_s3(
-                        latest_xlsx,
-                        get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"),
-                    )
 
+            result["local_only_mode"] = LOCAL_ONLY_MODE
+            result["excel_storage_policy"] = EXCEL_STORAGE_POLICY
+            result["excel_remote_uploaded"] = False
+            result["database_remote_uploaded"] = bool(_s3_configured())
             result["ok"] = bool(result["database_ok"] and result["excel_ok"])
             set_system_state("last_persist_reason", reason)
             set_system_state("last_persist_at", now_iso())
@@ -3889,8 +3903,8 @@ def sync_excel_repositories() -> dict:
     """Materializa el Excel global y un Excel estable por cada cuenta.
 
     Esta función se ejecuta inmediatamente después de guardar un estudio,
-    corregir cursores o modificar usuarios. Los archivos quedan disponibles en
-    el disco persistente configurado y el global se replica en S3 cuando aplica.
+    corregir cursores o modificar usuarios. Los archivos quedan exclusivamente
+    en LOCAL_EXCEL_DIR y nunca se replican ni restauran desde S3.
     """
     state = {"ok": False, "global_file": "", "user_files": [], "studies": 0, "error": ""}
     try:
@@ -3898,7 +3912,7 @@ def sync_excel_repositories() -> dict:
         if not integrity.get("ok"):
             raise RuntimeError(integrity.get("error", "La base no superó el control de integridad."))
         total_studies = int(integrity.get("studies", 0) or 0)
-        latest = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        latest = GLOBAL_EXCEL_PATH
         atomic_write_bytes(latest, export_excel({}, only_current_user=False))
         validate_excel_file(latest, expected_studies=total_studies)
         state["global_file"] = str(latest)
@@ -3959,7 +3973,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
         created_at = now_iso()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         db_file = BACKUP_DIR / f"cgi_base_completa_{stamp}.sqlite3"
-        xlsx_file = BACKUP_DIR / f"cgi_todos_los_estudios_{stamp}.xlsx"
+        xlsx_file = HISTORICAL_EXCEL_DIR / f"cgi_todos_los_estudios_{stamp}.xlsx"
         manifest_file = BACKUP_DIR / f"cgi_respaldo_{stamp}.json"
 
         create_sqlite_snapshot(db_file)
@@ -3968,7 +3982,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
         integrity = database_integrity_summary(db_file)
         if not integrity.get("ok"):
             raise RuntimeError(f"La base semanal no superó integridad: {integrity.get('error','sin detalle')}")
-        stable_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        stable_xlsx = GLOBAL_EXCEL_PATH
         stable_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
         stable_db_integrity = database_integrity_summary(stable_db) if stable_db.exists() else {}
         if int(integrity.get("studies", 0) or 0) == 0 and (
@@ -3992,7 +4006,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
         atomic_write_bytes(manifest_file, json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
 
         latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
-        latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+        latest_xlsx = GLOBAL_EXCEL_PATH
         latest_manifest = BACKUP_DIR / "cgi_respaldo_ultimo.json"
         shutil.copy2(db_file, latest_db)
         shutil.copy2(xlsx_file, latest_xlsx)
@@ -4005,10 +4019,9 @@ def generate_automatic_backup(force: bool = False) -> dict:
                 prefix = get_secret_value("CGI_S3_PREFIX", "cgi-backups").strip("/")
                 historical = f"{prefix}/historico/{datetime.now().strftime('%Y/%m')}"
                 _upload_backup_to_s3(db_file, f"{historical}/{db_file.name}")
-                _upload_backup_to_s3(xlsx_file, f"{historical}/{xlsx_file.name}")
+                # El Excel se excluye deliberadamente de toda subida remota.
                 _upload_backup_to_s3(manifest_file, f"{historical}/{manifest_file.name}")
                 _upload_backup_to_s3(latest_db, get_secret_value("CGI_S3_DB_KEY", f"{prefix}/latest/cgi_repositorio.sqlite3"))
-                _upload_backup_to_s3(latest_xlsx, get_secret_value("CGI_S3_EXCEL_KEY", f"{prefix}/latest/cgi_todos_los_estudios.xlsx"))
                 _upload_backup_to_s3(latest_manifest, f"{prefix}/latest/cgi_respaldo_manifest.json")
                 remote_ok = True
             except Exception as exc:
@@ -4023,17 +4036,25 @@ def generate_automatic_backup(force: bool = False) -> dict:
             "manifest_file": str(latest_manifest),
             "database_sha256": manifest["database"]["sha256"],
             "excel_sha256": manifest["excel"]["sha256"],
+            "local_only_mode": LOCAL_ONLY_MODE,
             "remote_configured": _s3_configured(),
             "remote_ok": remote_ok,
             "remote_error": remote_error,
+            "excel_storage_policy": EXCEL_STORAGE_POLICY,
+            "excel_local_directory": str(LOCAL_EXCEL_DIR),
+            "excel_remote_uploaded": False,
         }
         write_backup_state(state)
         set_system_state("last_weekly_backup_at", created_at)
         set_system_state("last_weekly_backup_status", "remote_ok" if remote_ok else ("local_only" if not _s3_configured() else "remote_error"))
 
         # Conserva hasta BACKUP_RETENTION_COUNT cortes cada 72 horas locales de cada tipo.
-        for pattern in ("cgi_base_completa_*.sqlite3", "cgi_todos_los_estudios_*.xlsx", "cgi_respaldo_*.json"):
-            old = sorted(BACKUP_DIR.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
+        for folder, pattern in (
+            (BACKUP_DIR, "cgi_base_completa_*.sqlite3"),
+            (HISTORICAL_EXCEL_DIR, "cgi_todos_los_estudios_*.xlsx"),
+            (BACKUP_DIR, "cgi_respaldo_*.json"),
+        ):
+            old = sorted(folder.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
             for file in old:
                 try:
                     file.unlink()
@@ -4043,7 +4064,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
 
 
 def backup_admin_panel() -> None:
-    st.markdown("#### Repositorio persistente y respaldo cada 72 horas")
+    st.markdown("#### Repositorio Excel local privado y respaldo cada 72 horas")
     integrity = database_integrity_summary()
     if integrity.get("ok"):
         st.success(
@@ -4070,27 +4091,45 @@ def backup_admin_panel() -> None:
     if last_error:
         st.warning(f"Último error de persistencia registrado: {last_error}")
 
+    if LOCAL_ONLY_MODE:
+        st.success(
+            "Modo LOCAL ONLY completo activo: ni los Excel ni la base SQLite con los valores importados "
+            "se suben o restauran desde S3 u otra nube."
+        )
+    else:
+        st.warning(
+            "CGI_LOCAL_ONLY_MODE está desactivado. El Excel sigue excluido de S3, pero la base SQLite "
+            "puede usar respaldo remoto si está configurado."
+        )
+    st.caption("Carpeta configurada para los Excel:")
+    st.code(str(LOCAL_EXCEL_DIR), language=None)
+    st.caption("Base SQLite local:")
+    st.code(str(DB_PATH), language=None)
+    st.info(
+        "Para que estas rutas pertenezcan al disco de su computadora, la app debe ejecutarse localmente. "
+        "Si se ejecuta en Streamlit Cloud, la carga ya ocurre en un servidor remoto y la ruta local pertenece "
+        "a ese servidor; descargue el Excel o ejecute esta versión en su PC para que los datos no pasen por la nube."
+    )
+
     if _s3_configured():
         if state.get("remote_ok"):
-            st.success("Persistencia remota S3 activa: copia estable tras cambios y corte histórico cada 72 horas versionado.")
+            st.caption("S3 puede conservar la base SQLite y el manifiesto, pero el Excel está excluido de la nube.")
         else:
-            st.warning(f"S3 está configurado, pero el último corte no confirmó la subida: {state.get('remote_error','sin detalle')}")
-        if st.button("Diagnosticar acceso S3", key="diagnose_s3_access"):
+            st.warning(
+                "S3 está configurado para la base SQLite, pero el último respaldo remoto no se confirmó: "
+                f"{state.get('remote_error','sin detalle')}. El Excel permanece local."
+            )
+        if st.button("Diagnosticar acceso S3 de la base", key="diagnose_s3_access"):
             diag = s3_preflight_database()
             if diag.get("ok"):
                 st.success(diag.get("message", "S3 verificado."))
             else:
                 st.warning(diag.get("message", "No se pudo validar S3."))
             st.caption(
-                f"Bucket: {diag.get('bucket') or '—'} · Key: {diag.get('key') or '—'} · "
+                f"Bucket: {diag.get('bucket') or '—'} · Key DB: {diag.get('key') or '—'} · "
                 f"Existe: {diag.get('exists')} · HEAD: {diag.get('head_allowed')} · LIST: {diag.get('list_allowed')} · "
                 f"Código: {diag.get('error_code') or '—'}"
             )
-    else:
-        st.error(
-            "Persistencia remota no configurada. El Excel local puede perderse en un reinicio o redeploy. "
-            "Configure CGI_S3_BUCKET y credenciales S3 para garantizar continuidad."
-        )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -4101,7 +4140,7 @@ def backup_admin_panel() -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"No se pudo generar el respaldo: {exc}")
-    latest_xlsx = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+    latest_xlsx = GLOBAL_EXCEL_PATH
     latest_db = BACKUP_DIR / "cgi_repositorio_ultimo.sqlite3"
     latest_manifest = BACKUP_DIR / "cgi_respaldo_ultimo.json"
     with c2:
@@ -4130,8 +4169,8 @@ def backup_admin_panel() -> None:
             key="download_latest_manifest",
         )
     st.caption(
-        "La app genera y conserva el archivo actualizado automáticamente. La descarga al disco de la computadora requiere pulsar el botón, "
-        "porque los navegadores bloquean descargas automáticas sin interacción del usuario."
+        "La app genera y conserva el Excel en LOCAL_EXCEL_DIR automáticamente. La descarga al disco del navegador requiere pulsar el botón, "
+        "porque el navegador no permite que una app web escriba silenciosamente en una carpeta de la computadora."
     )
 
 
@@ -4207,9 +4246,9 @@ def app_main() -> None:
         except Exception:
             pass
         st.warning(
-            "Modo local habilitado: AWS/S3 no pudo validarse, pero la aplicación inició con una base SQLite local. "
-            "Ya puede crear el administrador, usuarios y estudios. Los Excel se guardarán localmente. "
-            "En Streamlit Cloud, configure AWS antes de usar datos definitivos para conservarlos después de un redeploy."
+            "Modo local habilitado: la aplicación inició con base SQLite y repositorio Excel locales. "
+            "No se enviarán los valores importados a S3 mientras CGI_LOCAL_ONLY_MODE=true. "
+            "Para privacidad estrictamente local, ejecute la app en su computadora y no en Streamlit Cloud."
         )
         if fresh_empty_bootstrap_reason:
             st.caption(fresh_empty_bootstrap_reason)
@@ -4380,8 +4419,20 @@ def app_main() -> None:
                         )
                     else:
                         st.success(
-                            f"Informe guardado con ID {sid}. Código anónimo: {patient_code}. Excel actualizado automáticamente."
+                            f"Informe guardado con ID {sid}. Código anónimo: {patient_code}. "
+                            "Excel actualizado en el repositorio local; no fue enviado a la nube."
                         )
+                        local_excel, local_excel_error = ensure_user_excel_available(user)
+                        if local_excel and local_excel.exists():
+                            st.download_button(
+                                "Descargar ahora el Excel local actualizado",
+                                data=local_excel.read_bytes(),
+                                file_name=f"cgi_excel_completo_{user['username']}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"download_excel_after_save_{sid}",
+                            )
+                        elif local_excel_error:
+                            st.warning(f"No se pudo preparar la descarga inmediata: {local_excel_error}")
             except Exception as exc:
                 st.error(f"No se pudo procesar el informe: {exc}")
                 st.exception(exc)
@@ -4470,8 +4521,10 @@ def app_main() -> None:
         st.subheader("Mis estudios guardados")
         df_wide = studies_wide_df(user)
         st.caption(
-            "Cada fila corresponde a un estudio. El archivo se actualiza automáticamente después de cada guardado."
+            "Cada fila corresponde a un estudio. El archivo se actualiza automáticamente después de cada guardado "
+            "y permanece en el repositorio Excel local-only."
         )
+        st.code(str(user_excel_path(user.get("username", "usuario"))), language=None)
         st.dataframe(df_wide, use_container_width=True)
         my_excel, excel_error = ensure_user_excel_available(user)
         if my_excel and my_excel.exists():
@@ -4524,7 +4577,7 @@ def app_main() -> None:
             st.caption("Vista administrador: todos los usuarios, cada estudio con TODAS las variables CGI como columnas.")
             st.dataframe(all_wide, use_container_width=True)
             backup_admin_panel()
-            latest_admin_excel = BACKUP_DIR / "cgi_todos_los_estudios_ultimo.xlsx"
+            latest_admin_excel = GLOBAL_EXCEL_PATH
             if not latest_admin_excel.exists():
                 sync_state = sync_excel_repositories()
                 if not sync_state.get("ok"):
