@@ -2841,7 +2841,7 @@ def _set_signal_ylim(ax, values: np.ndarray, pad: float = 0.12) -> None:
         ax.set_ylim(-0.10, 1.10)
 
 
-def build_curve_chart(dzdt: pd.DataFrame, ecg: pd.DataFrame, fono: pd.DataFrame, auto: dict, manual: dict, guide: dict, x0: float, x1: float) -> dict:
+def build_curve_chart(dzdt: pd.DataFrame, ecg: pd.DataFrame, fono: pd.DataFrame, auto: dict, manual: dict, guide: dict, x0: float, x1: float, include_cursor_overlay: bool = True) -> dict:
     """Construye el gráfico de corrección de cursores con ejes optimizados.
 
     Cambio V4:
@@ -2909,7 +2909,10 @@ def build_curve_chart(dzdt: pd.DataFrame, ecg: pd.DataFrame, fono: pd.DataFrame,
             ax_fono.text(float(v), 0.98, lab, transform=ax_fono.get_xaxis_transform(), rotation=90, ha="center", va="top", fontsize=8)
 
     # Cursores: líneas tenues en todos los paneles y etiqueta fuerte en el panel más relevante.
-    for c in CURSORS:
+    # Se omiten cuando este gráfico se usa como FONDO del editor interactivo: allí los
+    # cursores los dibuja (y mueve) el overlay JavaScript. Hornearlos también en la
+    # imagen provocaba cursores duplicados (uno estático no corregible + uno móvil).
+    for c in (CURSORS if include_cursor_overlay else []):
         color = CURSOR_COLORS.get(c)
         try:
             ax_target = ax_ecg if c == "QRS" else ax_dzdt
@@ -4622,7 +4625,9 @@ def app_main() -> None:
                     cursor_state_key = f"manual_cursor_x::{source2}::{page2}::{preset}"
                     manual_x_init = st.session_state.get(cursor_state_key, {c: float(min(max(auto[c]["x"], x0c), x1c)) for c in CURSORS})
                     manual_preview = {c: {"x": float(manual_x_init.get(c, auto[c]["x"])), "y": interp_y(ecg if c == "QRS" else dzdt, float(manual_x_init.get(c, auto[c]["x"]))) } for c in CURSORS}
-                    chart_meta = build_curve_chart(dzdt, ecg, fono, auto, manual_preview, guide, x0c, x1c)
+                    # Fondo del editor SIN cursores horneados: evita duplicados. El overlay
+                    # interactivo dibuja QRS/B/C/X/Y una sola vez y todos son corregibles.
+                    chart_meta = build_curve_chart(dzdt, ecg, fono, auto, manual_preview, guide, x0c, x1c, include_cursor_overlay=False)
                     with st.expander("Mover cursores directamente sobre el gráfico", expanded=True):
                         adjusted_x = graph_adjust_cursors(chart_meta, manual_x_init, key_prefix=f"cursor_canvas_{source2}_{page2}_{preset}")
                     manual_x_final = {cur: float(min(max(adjusted_x.get(cur, auto[cur]["x"]), x0c), x1c)) for cur in CURSORS}
