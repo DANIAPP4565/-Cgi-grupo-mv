@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import io
@@ -12,6 +13,7 @@ import traceback
 import shutil
 import tempfile
 import threading
+import zipfile
 from datetime import timedelta
 from datetime import date, datetime
 from pathlib import Path
@@ -94,8 +96,8 @@ LOCAL_ONLY_MODE = (
     in {"1", "true", "yes", "si", "sí"}
 )
 
-BACKUP_INTERVAL_HOURS = 72  # corte histórico automático cada 72 horas
-BACKUP_RETENTION_COUNT = 610    # conserva hasta cinco años de cortes cada 72 horas
+BACKUP_INTERVAL_HOURS = 168  # corte histórico automático semanal (cada 7 días = 168 horas)
+BACKUP_RETENTION_COUNT = 260    # conserva hasta cinco años de cortes semanales
 
 # Instalación inicial confirmada sin usuarios ni estudios previos.
 # Modo local-first: si AWS/S3 todavía no está configurado o sus credenciales
@@ -3964,11 +3966,105 @@ def ensure_user_excel_available(user: dict) -> tuple[Path | None, str]:
         return None, str(exc)
 
 
+def build_weekly_batch_zip_bytes(manifest_path: Path | None = None) -> bytes:
+    """Empaqueta en un ZIP el lote semanal de hojas de cálculo.
+
+    Contiene el Excel global consolidado, un Excel por cada usuario activo y el
+    manifiesto de integridad. Es el 'lote' que se descarga automáticamente una
+    vez por semana. Todo permanece anonimizado según la política local-only.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        if GLOBAL_EXCEL_PATH.exists():
+            try:
+                zf.write(GLOBAL_EXCEL_PATH, arcname=f"global/{GLOBAL_EXCEL_PATH.name}")
+            except Exception:
+                pass
+        try:
+            user_files = sorted(USER_EXCEL_DIR.glob("*.xlsx"))
+        except Exception:
+            user_files = []
+        for uf in user_files:
+            try:
+                zf.write(uf, arcname=f"usuarios/{uf.name}")
+            except Exception:
+                continue
+        if manifest_path and Path(manifest_path).exists():
+            try:
+                zf.write(manifest_path, arcname=Path(manifest_path).name)
+            except Exception:
+                pass
+        readme = (
+            "Lote semanal de hojas de calculo CGI\n"
+            f"Generado: {now_iso()}\n"
+            "Contenido:\n"
+            " - global/  : Excel consolidado con todos los estudios.\n"
+            " - usuarios/: un Excel por cada usuario activo.\n"
+            " - manifiesto JSON con conteos y checksums SHA-256.\n"
+        )
+        zf.writestr("LEEME.txt", readme)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _render_browser_autodownload(file_path: Path, filename: str, fire: bool, dom_key: str) -> None:
+    """Dispara una descarga en el navegador hacia la carpeta Descargas del usuario.
+
+    En Streamlit Cloud el servidor no puede escribir en el disco del usuario, pero
+    sí puede inducir al navegador a guardar el archivo en su carpeta de descargas
+    predeterminada mediante un enlace data-URI auto-pulsado por JavaScript.
+    """
+    try:
+        import streamlit.components.v1 as components
+        data = Path(file_path).read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        trigger = "true" if fire else "false"
+        html = (
+            "<html><body style=\"margin:0\">"
+            f"<a id=\"{dom_key}\" download=\"{filename}\" "
+            f"href=\"data:application/zip;base64,{b64}\" "
+            "style=\"font-family:sans-serif;font-size:12px\">Descargar " + filename + "</a>"
+            "<script>(function(){"
+            f"var fire={trigger};var a=document.getElementById(\"{dom_key}\");"
+            "if(fire&&a){setTimeout(function(){try{a.click();}catch(e){}},500);}"
+            "})();</script>"
+            "</body></html>"
+        )
+        components.html(html, height=24)
+    except Exception:
+        pass
+
+
+def maybe_auto_download_weekly_batch_admin() -> None:
+    """Auto-descarga el lote semanal más reciente una sola vez por sesión de admin."""
+    try:
+        state = read_backup_state()
+    except Exception:
+        state = {}
+    zip_path = state.get("batch_zip_file", "")
+    stamp = str(state.get("batch_stamp", "") or "")
+    if not zip_path or not stamp or not Path(zip_path).exists():
+        return
+    session_key = "_cgi_batch_autodl_stamp"
+    if st.session_state.get(session_key) == stamp:
+        return
+    st.session_state[session_key] = stamp
+    _render_browser_autodownload(
+        Path(zip_path),
+        f"cgi_lote_excel_semanal_{stamp}.zip",
+        fire=True,
+        dom_key="cgi_auto_batch_dl",
+    )
+
+
 def generate_automatic_backup(force: bool = False) -> dict:
     """Genera un corte histórico cada 72 horas de SQLite + Excel + manifiesto SHA-256."""
     with BACKUP_LOCK:
         if not force and not backup_due():
-            return read_backup_state()
+            prev = read_backup_state()
+            if isinstance(prev, dict):
+                prev["just_created"] = False
+            return prev
 
         created_at = now_iso()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4012,6 +4108,14 @@ def generate_automatic_backup(force: bool = False) -> dict:
         shutil.copy2(xlsx_file, latest_xlsx)
         shutil.copy2(manifest_file, latest_manifest)
 
+        # Lote semanal de hojas de cálculo: ZIP con Excel global + Excel por
+        # usuario + manifiesto. Es lo que se baja automáticamente cada semana.
+        batch_zip_file = BACKUP_DIR / f"cgi_lote_excel_semanal_{stamp}.zip"
+        latest_batch_zip = BACKUP_DIR / "cgi_lote_excel_semanal_ultimo.zip"
+        atomic_write_bytes(batch_zip_file, build_weekly_batch_zip_bytes(latest_manifest))
+        shutil.copy2(batch_zip_file, latest_batch_zip)
+        batch_zip_sha256 = sha256_file(latest_batch_zip)
+
         remote_ok = False
         remote_error = ""
         if _s3_configured():
@@ -4043,6 +4147,11 @@ def generate_automatic_backup(force: bool = False) -> dict:
             "excel_storage_policy": EXCEL_STORAGE_POLICY,
             "excel_local_directory": str(LOCAL_EXCEL_DIR),
             "excel_remote_uploaded": False,
+            "batch_zip_file": str(latest_batch_zip),
+            "batch_zip_name": batch_zip_file.name,
+            "batch_zip_sha256": batch_zip_sha256,
+            "batch_stamp": stamp,
+            "just_created": True,
         }
         write_backup_state(state)
         set_system_state("last_weekly_backup_at", created_at)
@@ -4053,6 +4162,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
             (BACKUP_DIR, "cgi_base_completa_*.sqlite3"),
             (HISTORICAL_EXCEL_DIR, "cgi_todos_los_estudios_*.xlsx"),
             (BACKUP_DIR, "cgi_respaldo_*.json"),
+            (BACKUP_DIR, "cgi_lote_excel_semanal_*.zip"),
         ):
             old = sorted(folder.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)[BACKUP_RETENTION_COUNT:]
             for file in old:
@@ -4064,7 +4174,7 @@ def generate_automatic_backup(force: bool = False) -> dict:
 
 
 def backup_admin_panel() -> None:
-    st.markdown("#### Repositorio Excel local privado y respaldo cada 72 horas")
+    st.markdown("#### Repositorio Excel local privado y respaldo semanal automático")
     integrity = database_integrity_summary()
     if integrity.get("ok"):
         st.success(
@@ -4076,10 +4186,10 @@ def backup_admin_panel() -> None:
 
     state = read_backup_state()
     if state:
-        st.info(f"Último corte cada 72 horas: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
+        st.info(f"Último corte semanal: {state.get('created_at','—')} · Próximo: {state.get('next_due_at','—')}")
         st.caption(f"SHA-256 Excel: {state.get('excel_sha256','—')} · SHA-256 DB: {state.get('database_sha256','—')}")
     else:
-        st.warning("Todavía no se generó el primer corte cada 72 horas.")
+        st.warning("Todavía no se generó el primer corte semanal.")
 
     last_persist = get_system_state("last_persist_at", "")
     last_error = get_system_state("last_persist_error", "")
@@ -4133,7 +4243,7 @@ def backup_admin_panel() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Generar corte cada 72 horas ahora", key="force_backup_now"):
+        if st.button("Generar lote semanal ahora", key="force_backup_now"):
             try:
                 state = generate_automatic_backup(force=True)
                 st.success(f"Respaldo validado: {state.get('created_at','')}")
@@ -4168,9 +4278,34 @@ def backup_admin_panel() -> None:
             mime="application/json",
             key="download_latest_manifest",
         )
+    latest_batch_zip = BACKUP_DIR / "cgi_lote_excel_semanal_ultimo.zip"
+    if latest_batch_zip.exists():
+        st.markdown("##### Lote semanal de hojas de cálculo (ZIP)")
+        st.download_button(
+            "Descargar lote semanal de Excel (ZIP)",
+            data=latest_batch_zip.read_bytes(),
+            file_name=f"cgi_lote_excel_semanal_{date.today().isoformat()}.zip",
+            mime="application/zip",
+            key="download_latest_batch_zip",
+        )
+        if st.button("Bajar el lote ahora a mi carpeta Descargas", key="force_autodl_batch"):
+            _render_browser_autodownload(
+                latest_batch_zip,
+                f"cgi_lote_excel_semanal_{date.today().isoformat()}.zip",
+                fire=True,
+                dom_key="cgi_manual_batch_dl",
+            )
+            st.success("Se disparó la descarga del lote hacia la carpeta de descargas del navegador.")
+        st.caption(
+            "Este ZIP reúne el Excel consolidado, un Excel por usuario y el manifiesto. "
+            "Cuando un administrador abre la app tras un nuevo corte semanal, el lote se descarga "
+            "automáticamente a la carpeta de Descargas del navegador (una vez por sesión)."
+        )
     st.caption(
-        "La app genera y conserva el Excel en LOCAL_EXCEL_DIR automáticamente. La descarga al disco del navegador requiere pulsar el botón, "
-        "porque el navegador no permite que una app web escriba silenciosamente en una carpeta de la computadora."
+        "La app genera y conserva el Excel en LOCAL_EXCEL_DIR automáticamente y arma un lote semanal en ZIP. "
+        "En Streamlit Cloud el servidor no puede escribir directamente en su disco: por eso el lote se entrega "
+        "mediante una descarga automática del navegador hacia su carpeta Descargas. Si su navegador bloquea la "
+        "descarga automática, use el botón para bajarla manualmente."
     )
 
 
@@ -4282,6 +4417,11 @@ def app_main() -> None:
         return
     st.session_state.user = dict(refreshed)
     user = st.session_state.user
+    if str(user.get("role", "")) == "admin":
+        try:
+            maybe_auto_download_weekly_batch_admin()
+        except Exception:
+            pass
     if int(user.get("must_change_password", 0)):
         st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>Actualización obligatoria de credenciales</p><div class='dev'>{APP_DEVELOPER}</div></div>", unsafe_allow_html=True)
         forced_password_change_ui(user)
